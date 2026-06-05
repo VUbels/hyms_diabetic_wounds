@@ -1,0 +1,2 @@
+region	xenium_cells	proseg_cells	cell_diff	cell_diff_pct	xenium_tx_per_cell_mean	xenium_tx_per_cell_median	xenium_tx_per_cell_std	xenium_area_mean	xenium_area_median	total_transcripts	xenium_assigned_tx	xenium_assigned_pct	proseg_assigned_tx	proseg_assigned_pct
+XE791-D	65626	65626	0	0.0	80.5191539938439	11.0	149.5773492617333	44.936820715347984	31.47390739247203	7111926	5921703	83.26440685687675	5025321	79.36503499419132

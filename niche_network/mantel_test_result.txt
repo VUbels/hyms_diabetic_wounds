@@ -1,0 +1,13 @@
+Mantel test: Ctrl vs Test niche proximity matrices
+  n niche pairs : 153
+  Pearson r     : 0.6334
+  p-value       : 0.0001
+  permutations  : 9999
+
+Interpretation (corrected):
+  The Mantel test asks whether the two proximity matrices are
+  CORRELATED. High r with a SIGNIFICANT (low) p therefore means the
+  niche architecture is CONSERVED between conditions, NOT reorganised.
+  Reorganisation is indicated by (i) departure of points from the
+  y=x line in the scatter, (ii) large per-edge Δ values, and (iii)
+  the global permutation pseudo-F test below.
