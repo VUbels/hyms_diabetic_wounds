@@ -4,6 +4,7 @@
 .Ruserdata
 
 *.h5ad
+*.h5ad.bak
 *.h5
 *.rds
 *.parquet
