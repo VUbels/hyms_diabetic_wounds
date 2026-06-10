@@ -1,12 +1,11 @@
 #!/usr/bin/env python
 """
-analysis_condition_factor_roles.py
-==================================
+comm_b_factor_roles.py
+###############################################################################
 Signalling-factor-level dual-role analysis.
 
-SASP-factor-level analysis:
-it decomposes the composite signature (condition_genes.txt = your SASP, this can be metal/senescence
-list) into individual secreted signalling factors and asks, per factor:
+It decomposes the composite signature (condition_genes.txt) into individual
+secreted signalling factors and asks, per factor:
 
     (i)   is it enriched in CNTRL or TEST?         -> pseudobulk DE by SAMPLE
                                                        (pydeseq2 / DESeq2; the
@@ -17,27 +16,28 @@ list) into individual secreted signalling factors and asks, per factor:
           it target?                                  communication step's
                                                        focused L-R table
     (iv)  does the literature class it pro- or      -> from an editable role table
-          anti-(healing / the process of interest)?    (factor_roles_template.csv)
+          anti-(the process of interest)?    (factor_roles_template.csv)
 
-Deliverable: "pro-process factors enriched in CNTRL  vs  anti-process factors enriched in TEST"
-i.e. a dual-role map where x = log2FC(TEST vs CNTRL) and colour = pro/anti role.
+Deliverable: a dual-role map framed generically as
+    "pro-process factors enriched in CNTRL  vs  anti-process factors enriched in TEST"
+i.e. x = log2FC(TEST vs CNTRL) and colour = the pro/anti role from the role table.
+The framing is produced FROM the data + role table, never hard-coded.
 
 It is deliberately CNTRL/TEST + condition_genes driven so it is reusable for any
 two-level contrast and any signature.
 
 EXAMPLE
--------
-    python analysis_condition_factor_roles.py \
+###############################################################################
+    python comm_b_factor_roles.py \
         --h5ad nichecompass_results/objects/nichecompass_integrated.h5ad \
         --genes condition_genes.txt \
-        --cntrl LS --test HS \
         --liana-csv communication_results/liana_res_per_sample_spatial.csv \
         --focused-csv communication_results/focused_sender_receiver_interactions.csv \
         --roles-csv factor_roles_template.csv \
-        --out-dir factor_roles_results
+        --output_dir factor_roles_results
 
 DEPENDENCIES
-------------
+###############################################################################
     scanpy anndata pydeseq2 liana  (+ numpy pandas matplotlib scipy)
 If pydeseq2 is unavailable, pass --de-backend export to write the pseudobulk
 matrices + a ready-to-run R DESeq2/edgeR script (run_pseudobulk_DE.R) instead.
@@ -52,16 +52,20 @@ import warnings
 import numpy as np
 import pandas as pd
 
-import cc_common as cc
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import common_py_functions as cf
 
 
-# ---------------------------------------------------------------------------
+###############################################################################
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    cc.add_common_args(p)
-    # the shared default out-dir is for the communication step; override it here
-    p.set_defaults(out_dir="factor_roles_results")
+    cf.add_common_args(p)
+    # the shared default output dir is the communication step's; override here
+    p.set_defaults(output_dir="factor_roles_results")
 
     g = p.add_argument_group("inputs from the communication step")
     g.add_argument("--liana-csv", default=None,
@@ -96,9 +100,9 @@ def parse_args():
     return p.parse_args()
 
 
-# ---------------------------------------------------------------------------
+###############################################################################
 # Pseudobulk differential expression per cell type
-# ---------------------------------------------------------------------------
+###############################################################################
 def _make_dds(counts_ct: pd.DataFrame, coldata_ct: pd.DataFrame, cond_col: str,
               cntrl: str, test: str, n_cpus: int = 4):
     """Construct a pydeseq2 DeseqDataSet across the supported signatures."""
@@ -139,13 +143,13 @@ def _deseq_stats(dds, cond_col: str, cntrl: str, test: str):
     return res
 
 
-def pseudobulk_de_by_celltype(adata, cfg: cc.CCConfig, counts_layer: str, args) -> pd.DataFrame:
+def pseudobulk_de_by_celltype(adata, cfg, counts_layer: str, args) -> pd.DataFrame:
     """For each cell type, build a (sample x cell-type) pseudobulk and run DESeq2
     TEST vs CNTRL. Returns long-form DE table (gene, cell_type, log2FC, padj, ...)."""
-    cc.banner("Pseudobulk DE per cell type (TEST vs CNTRL)")
-    counts_df, coldata = cc.pseudobulk_matrix(
-        adata, cfg, counts_layer,
-        group_keys=[cfg.sample_key, cfg.celltype_key])
+    cf.banner("Pseudobulk DE per cell type (TEST vs CNTRL)")
+    counts_df, coldata = cf.pseudobulk_matrix(
+        adata, group_keys=[cfg.sample_key, cfg.celltype_key],
+        counts_layer=counts_layer)
     # drop tiny pseudobulks
     coldata = coldata[coldata["_n_cells"] >= args.min_cells_pb]
     counts_df = counts_df[coldata.index]
@@ -183,18 +187,20 @@ def pseudobulk_de_by_celltype(adata, cfg: cc.CCConfig, counts_layer: str, args) 
     return pd.concat(all_res, ignore_index=True)
 
 
-def export_pseudobulk_for_R(adata, cfg: cc.CCConfig, counts_layer: str, args, out_dir: str):
+def export_pseudobulk_for_R(adata, cfg, counts_layer: str, args, out_dir: str):
     """Write per-cell-type pseudobulk count matrices + colData for an R DESeq2/edgeR run."""
-    cc.banner("Exporting pseudobulk matrices for R (DESeq2/edgeR)")
-    counts_df, coldata = cc.pseudobulk_matrix(
-        adata, cfg, counts_layer, group_keys=[cfg.sample_key, cfg.celltype_key])
+    cf.banner("Exporting pseudobulk matrices for R (DESeq2/edgeR)")
+    counts_df, coldata = cf.pseudobulk_matrix(
+        adata, group_keys=[cfg.sample_key, cfg.celltype_key],
+        counts_layer=counts_layer)
     coldata = coldata[coldata["_n_cells"] >= args.min_cells_pb]
     counts_df = counts_df[coldata.index]
     coldata[cfg.condition_key] = (
         adata.obs[[cfg.sample_key, cfg.condition_key]].astype(str)
         .drop_duplicates().set_index(cfg.sample_key)[cfg.condition_key]
         .reindex(coldata[cfg.sample_key].values).values)
-    pb_dir = cc.ensure_out(cfg, "pseudobulk")
+    pb_dir = os.path.join(out_dir, "pseudobulk")
+    os.makedirs(pb_dir, exist_ok=True)
     counts_df.to_csv(os.path.join(pb_dir, "pseudobulk_counts_genes_x_pb.csv"))
     coldata.to_csv(os.path.join(pb_dir, "pseudobulk_coldata.csv"))
     meta = {"sample_key": cfg.sample_key, "celltype_key": cfg.celltype_key,
@@ -208,10 +214,10 @@ def export_pseudobulk_for_R(adata, cfg: cc.CCConfig, counts_layer: str, args, ou
           f"{cfg.condition_key} {cfg.cntrl} {cfg.test} {pb_dir}/de_results.csv")
 
 
-# ---------------------------------------------------------------------------
+###############################################################################
 # Per-cell-type expression of each factor (who secretes it)
-# ---------------------------------------------------------------------------
-def expression_by_celltype(adata_ln, cfg: cc.CCConfig, genes) -> pd.DataFrame:
+###############################################################################
+def expression_by_celltype(adata_ln, cfg, genes) -> pd.DataFrame:
     """Mean log-normalised expression + fraction expressing, per cell type, for each gene."""
     import scipy.sparse as sp
     present = [g for g in genes if g in adata_ln.var_names]
@@ -231,7 +237,7 @@ def expression_by_celltype(adata_ln, cfg: cc.CCConfig, genes) -> pd.DataFrame:
     return long.merge(fr, on=[cfg.celltype_key, "gene"], how="left")
 
 
-def top_secretors(expr_long: pd.DataFrame, cfg: cc.CCConfig, n: int = 2) -> pd.DataFrame:
+def top_secretors(expr_long: pd.DataFrame, cfg, n: int = 2) -> pd.DataFrame:
     """For each gene, the top-n cell types by mean expression."""
     if expr_long.empty:
         return pd.DataFrame()
@@ -245,9 +251,9 @@ def top_secretors(expr_long: pd.DataFrame, cfg: cc.CCConfig, n: int = 2) -> pd.D
     return pd.DataFrame(out)
 
 
-# ---------------------------------------------------------------------------
+###############################################################################
 # Assemble the dual-role table
-# ---------------------------------------------------------------------------
+###############################################################################
 def receptor_targets_for_ligand(focused: pd.DataFrame, ligand: str,
                                 fallback: pd.DataFrame = None) -> str:
     """From the focused L-R table, summarise receptor(s) and receiver(s) for a ligand.
@@ -274,9 +280,9 @@ def receptor_targets_for_ligand(focused: pd.DataFrame, ligand: str,
 
 def build_dual_role_table(de: pd.DataFrame, expr_long: pd.DataFrame, focused: pd.DataFrame,
                           roles: pd.DataFrame, genes, ligand_set: set,
-                          cfg: cc.CCConfig, args, full_liana: pd.DataFrame = None) -> pd.DataFrame:
+                          cfg, args, full_liana: pd.DataFrame = None) -> pd.DataFrame:
     """One row per signature factor: direction, secretor, receptor/receiver, role."""
-    cc.banner("Assembling the dual-role factor table")
+    cf.banner("Assembling the dual-role factor table")
     # universe of factors = signature genes (optionally restricted to ligands)
     factors = [g for g in genes if (not args.ligands_only or g in ligand_set)]
     if not factors:
@@ -339,7 +345,7 @@ def build_dual_role_table(de: pd.DataFrame, expr_long: pd.DataFrame, focused: pd
                            ascending=[False, False])
 
 
-def _dual_role_label(r, cfg: cc.CCConfig) -> str:
+def _dual_role_label(r, cfg) -> str:
     """Translate (role, direction) into an interpretable call without hard-coding biology."""
     role = str(r["literature_role"])
     enr = str(r["enriched_in"])
@@ -352,13 +358,12 @@ def _dual_role_label(r, cfg: cc.CCConfig) -> str:
     return f"role-unassigned & enriched in {enr}"
 
 
-# ---------------------------------------------------------------------------
-# Figures: the Fig-7D/E analog
-# ---------------------------------------------------------------------------
-def plot_dual_role_map(table: pd.DataFrame, cfg: cc.CCConfig, out_dir: str):
+###############################################################################
+# Figures: the dual-role map
+###############################################################################
+def plot_dual_role_map(table: pd.DataFrame, cfg, out_dir: str):
     if table.empty:
         return
-    plt = cc.set_plot_theme()
     role_colors = {"pro": "#2E7D32", "anti": "#C62828", "context": "#6A1B9A",
                    "unassigned": "#9E9E9E"}
     d = table.dropna(subset=["log2FC_TEST_vs_CNTRL"]).copy()
@@ -375,7 +380,7 @@ def plot_dual_role_map(table: pd.DataFrame, cfg: cc.CCConfig, out_dir: str):
         if r["differential"]:
             ax.text(r["log2FC_TEST_vs_CNTRL"] +
                     (0.05 if r["log2FC_TEST_vs_CNTRL"] >= 0 else -0.05),
-                    yi, cc.pval_stars(r["padj"]), va="center",
+                    yi, cf.pval_stars(r["padj"]), va="center",
                     ha="left" if r["log2FC_TEST_vs_CNTRL"] >= 0 else "right",
                     fontsize=7)
     ax.axvline(0, color="k", lw=0.8)
@@ -392,11 +397,10 @@ def plot_dual_role_map(table: pd.DataFrame, cfg: cc.CCConfig, out_dir: str):
     plt.close(fig)
 
 
-def plot_role_direction_crosstab(table: pd.DataFrame, cfg: cc.CCConfig, out_dir: str):
+def plot_role_direction_crosstab(table: pd.DataFrame, cfg, out_dir: str):
     """The summary cross-tab: do anti-process factors concentrate in TEST and pro- in CNTRL?"""
     if table.empty:
         return
-    plt = cc.set_plot_theme()
     d = table[table["differential"]].copy()
     if d.empty:
         return
@@ -415,18 +419,24 @@ def plot_role_direction_crosstab(table: pd.DataFrame, cfg: cc.CCConfig, out_dir:
     plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
+###############################################################################
 def main():
     args = parse_args()
-    cfg = cc.config_from_args(args)
-    cfg.resource_name = args.resource
-    out_dir = cc.ensure_out(cfg)
+    cf.apply_common_args(args)
 
-    cc.banner("LOADING DATA")
-    adata = cc.load_adata(args.h5ad)
-    cfg = cc.resolve_keys(adata, cfg, require_niche=False)
-    counts_layer = cc.resolve_counts_layer(adata, cfg)
-    genes = cc.load_condition_genes(args.genes_path)
+    # Resolved keys/labels live on the shared module; gather the few per-run
+    # values this script reads into a namespace so the bodies below are unchanged.
+    cfg = argparse.Namespace(
+        cntrl=cf.CONDITION_CNTRL, test=cf.CONDITION_TEST,
+        celltype_key=cf.CELLTYPE_KEY, sample_key=cf.SAMPLE_KEY,
+        condition_key=cf.CONDITION_KEY, resource_name=args.resource,
+    )
+    out_dir = cf.ensure_out(args.output_dir)
+
+    cf.banner("LOADING DATA")
+    adata = cf.load_adata(args.h5ad, require=("celltype", "sample", "condition"), exclude_samples=cf.resolve_exclude(args))
+    counts_layer = cf.resolve_counts_layer(adata)
+    genes = list(cf.CONDITION_GENES)
     if not genes:
         raise SystemExit("This analysis needs a signature: pass --genes condition_genes.txt")
     print(f"  cells={adata.n_obs} genes={adata.n_vars}; signature factors={len(genes)}")
@@ -434,7 +444,7 @@ def main():
 
     # which signature genes are secreted ligands?
     try:
-        ligand_set, _ = cc.ligand_receptor_universe(args.resource)
+        ligand_set, _ = cf.ligand_receptor_universe(args.resource)
     except Exception as e:
         warnings.warn(f"Could not load LIANA resource ({e}); treating all factors as ligands.")
         ligand_set = set(genes)
@@ -442,7 +452,7 @@ def main():
     print(f"  signature factors that are ligands in '{args.resource}': {n_lig}/{len(genes)}")
 
     # log-normalised view for expression-by-cell-type
-    adata_ln = cc.make_lognorm_view(adata, cfg, counts_layer)
+    adata_ln = cf.make_lognorm_view(adata, counts_layer=counts_layer)
 
     # (i) DE by sample (pseudobulk) ---------------------------------------
     if args.de_backend == "export":
@@ -500,14 +510,14 @@ def main():
         print("\nDual-role table (head):")
         print(table.head(25).to_string(index=False))
 
-    fig_dir = cc.ensure_out(cfg, "figures")
+    fig_dir = os.path.join(out_dir, "figures")
     try:
         plot_dual_role_map(table, cfg, fig_dir)
         plot_role_direction_crosstab(table, cfg, fig_dir)
     except Exception as e:
         warnings.warn(f"Figure generation issue: {e}")
 
-    cc.write_report(cfg, {
+    cf.write_report(out_dir, {
         "n_signature_factors": len(genes),
         "n_ligand_factors": int(n_lig),
         "de_backend": args.de_backend,
@@ -515,11 +525,11 @@ def main():
         "n_factors_tabulated": int(len(table)),
         "n_differential": int(table["differential"].sum()) if not table.empty else 0,
         "padj_threshold": args.padj_threshold,
-        "caveats": cc.CAVEATS,
-    }, "condition_factor_roles_report.json")
+        "caveats": cf.CAVEATS,
+    }, "factor_roles_report.json")
 
-    print(cc.CAVEATS)
-    cc.banner("DONE: signalling-factor dual-role analysis")
+    print(cf.CAVEATS)
+    cf.banner("DONE: signalling-factor dual-role analysis")
     print(f"Outputs in: {out_dir}")
 
 

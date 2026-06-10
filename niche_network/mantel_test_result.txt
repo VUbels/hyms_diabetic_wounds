@@ -1,4 +1,4 @@
-Mantel test: Ctrl vs Test niche proximity matrices
+Mantel test: TEST vs CNTRL niche proximity matrices
   n niche pairs : 153
   Pearson r     : 0.6334
   p-value       : 0.0001

@@ -494,7 +494,7 @@ build_proseg_seurat <- function(proseg_dir,
 annotate_proseg_seurat_10x <- function(
     proseg_dir = "./proseg_results",
     reference_dir = "./reference",
-    ref_label_col = "CellType",
+    ref_label_col = "cell_type",
     output_dir = "./annotated_data",
     ref_method = "pca",
     dims = 1:30,
@@ -579,7 +579,7 @@ annotate_proseg_seurat_10x <- function(
   ##########################################################################
   # Load reference — BPCells on-disk counts, then preprocess
   ##########################################################################
-  ref_path <- file.path(reference_dir, "reference_prepared.rds")
+  ref_path <- file.path(reference_dir, "consensus_reference.rds")
   cat(ts(), "[REF] Loading:", ref_path, "\n")
   reference_obj <- readRDS(ref_path)
   DefaultAssay(reference_obj) <- "RNA"

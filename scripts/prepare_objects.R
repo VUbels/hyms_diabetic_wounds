@@ -21,7 +21,7 @@ build_proseg_seurat(
 annotate_proseg_seurat_10x(
   proseg_dir = "./proseg_results_mask",
   reference_dir = "./reference",
-  ref_label_col = "subclustering",
+  ref_label_col = "cell_type",
   output_dir = "./annotated_data",
   ref_method = "pca",
   dims = 1:30,

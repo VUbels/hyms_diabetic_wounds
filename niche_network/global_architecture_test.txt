@@ -1,9 +1,9 @@
-Global niche-architecture reorganisation test (n=3 HS vs n=3 LS slides)
+Global niche-architecture reorganisation test (n=3 TEST vs n=3 CNTRL slides)
 PERMANOVA-style pseudo-F on per-slide edge vectors; exact label
-permutation (slide = unit). Larger F / smaller p => Ctrl and Test slides
+permutation (slide = unit). Larger F / smaller p => TEST and CNTRL slides
 differ more in architecture than expected by chance.
 
 [proximity_p25] edges=136, slides=6, pseudo-F=4.589, perm p(F)=0.100, centroid-dist p=0.100, n_perm=20
 [contact_freq] edges=136, slides=6, pseudo-F=2.190, perm p(F)=0.100, centroid-dist p=0.100, n_perm=20
 
-NOTE: with n=3 HS vs n=3 LS slides the smallest achievable permutation p is 0.05.
+NOTE: with n=3 TEST vs n=3 CNTRL slides the smallest achievable permutation p is 0.05.

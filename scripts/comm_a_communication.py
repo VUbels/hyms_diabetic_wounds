@@ -1,12 +1,12 @@
 #!/usr/bin/env python
 """
-analysis_cellcell_communication.py
-==================================
-Cell-cell communication layer (the directional sender -> receiver ligand-receptor
-analysis; the Figure-7 analog of the reference paper).
+comm_a_communication.py
+###############################################################################
+Cell-cell communication layer: the directional sender -> receiver ligand-receptor
+analysis.
 
 WHAT IT DOES
-------------
+###############################################################################
 1. Loads the integrated AnnData, log-normalises a working copy for LIANA while
    keeping raw counts in a layer.
 2. Runs LIANA+ consensus (rank_aggregate) ligand-receptor scoring PER SAMPLE,
@@ -30,19 +30,22 @@ Everything is phrased as CNTRL vs TEST and driven by a generic gene list
 (condition_genes.txt) so the script is reusable across datasets/conditions.
 
 EXAMPLE
--------
-    python analysis_cellcell_communication.py \
+###############################################################################
+    python comm_a_communication.py \
         --h5ad nichecompass_results/objects/nichecompass_integrated.h5ad \
         --genes condition_genes.txt \
-        --cntrl L --test D \
-        --sender-celltypes "Fibroblast" "Macrophage" "Endothelial" \
-        --receiver-celltypes "Keratinocyte" "Fibroblast" "Endothelial" \
+        --sender-celltypes "SenderTypeA" "SenderTypeB" \
+        --receiver-celltypes "ReceiverTypeA" "ReceiverTypeB" \
         --spatial-mode colocalization \
-        --split-by-signature \
-        --out-dir communication_results
+        --split-by-condition \
+        --output_dir communication_results
+
+Senders and receivers are whichever cell types you pass on the command line; use
+--split-by-condition to additionally split each cell type into condition-high /
+condition-low compartments (generalises 'condition-high cells as senders').
 
 DEPENDENCIES
-------------
+###############################################################################
     scanpy anndata squidpy liana cell2cell  (+ numpy pandas matplotlib scipy)
 Tensor-cell2cell factorisation can use a GPU (--device cuda) but runs on CPU.
 APIs of liana / cell2cell are version-sensitive; pinned calls are noted inline.
@@ -57,14 +60,18 @@ import warnings
 import numpy as np
 import pandas as pd
 
-import cc_common as cc
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import common_py_functions as cf
 
 
-# ---------------------------------------------------------------------------
+###############################################################################
 def parse_args():
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    cc.add_common_args(p)
+    cf.add_common_args(p)
 
     g = p.add_argument_group("LIANA")
     g.add_argument("--resource", default="consensus",
@@ -88,15 +95,14 @@ def parse_args():
     g2.add_argument("--coloc-min-samples-frac", type=float, default=1 / 3.0,
                     help="Keep a pair if co-localised in at least this fraction of samples.")
 
-    g3 = p.add_argument_group("focus + signature split")
+    g3 = p.add_argument_group("focus + condition split")
     g3.add_argument("--sender-celltypes", nargs="*", default=[],
                     help="Cell-type labels to treat as senders in the focused view.")
     g3.add_argument("--receiver-celltypes", nargs="*", default=[],
                     help="Cell-type labels to treat as receivers in the focused view.")
-    g3.add_argument("--split-by-signature", action="store_true",
-                    help="Also split each group into signature +/- compartments "
-                         "(generalises 'senescent cells as senders').")
-    g3.add_argument("--signature-pos-quantile", type=float, default=0.75)
+    g3.add_argument("--split-by-condition", action="store_true",
+                    help="Also split each group into condition-high / condition-low compartments "
+                         "(generalises 'condition-high cells as senders').")
 
     g4 = p.add_argument_group("tensor")
     g4.add_argument("--tensor-rank", type=int, default=None,
@@ -110,11 +116,11 @@ def parse_args():
     return p.parse_args()
 
 
-# ---------------------------------------------------------------------------
-def run_liana_by_sample(adata_ln, cfg: cc.CCConfig, args, groupby: str) -> pd.DataFrame:
+###############################################################################
+def run_liana_by_sample(adata_ln, cfg, args, groupby: str) -> pd.DataFrame:
     """Run LIANA rank_aggregate per sample; return the long-form result frame."""
     import liana as li
-    cc.banner(f"LIANA rank_aggregate (resource={args.resource}, groupby={groupby})")
+    cf.banner(f"LIANA rank_aggregate (resource={args.resource}, groupby={groupby})")
 
     # drop tiny groups per sample so LIANA does not score ghost cell types
     keep = np.ones(adata_ln.n_obs, dtype=bool)
@@ -149,19 +155,19 @@ def run_liana_by_sample(adata_ln, cfg: cc.CCConfig, args, groupby: str) -> pd.Da
     return res
 
 
-def apply_spatial_constraint(liana_res: pd.DataFrame, adata, cfg: cc.CCConfig, args):
+def apply_spatial_constraint(liana_res: pd.DataFrame, adata, cfg, args):
     """Filter the long-form LIANA frame to spatially-plausible (sample, source, target)
     triples. Returns (filtered_res, coloc_table)."""
     if args.spatial_mode == "none":
-        cc.banner("Spatial constraint: NONE (using all sender/receiver pairs)")
+        cf.banner("Spatial constraint: NONE (using all sender/receiver pairs)")
         return liana_res, pd.DataFrame()
 
     if args.spatial_mode == "within_niche":
-        cc.banner("Spatial constraint: WITHIN-NICHE")
+        cf.banner("Spatial constraint: WITHIN-NICHE")
         # Restrict each cell to its niche, recompute LIANA per (sample, niche) would be
         # ideal but expensive; instead we keep L-R calls only where sender & receiver
         # co-occur within the same niche in that sample (cheap, faithful proxy).
-        groupby = cfg.resolve_groupby()
+        groupby = cfg.groupby_col
         allowed = set()
         for samp, idx in adata.obs.groupby(cfg.sample_key).groups.items():
             sub = adata.obs.loc[idx]
@@ -181,16 +187,17 @@ def apply_spatial_constraint(liana_res: pd.DataFrame, adata, cfg: cc.CCConfig, a
         return filt, pd.DataFrame()
 
     # default: colocalization
-    cc.banner(f"Spatial constraint: CO-LOCALISATION ({args.coloc_metric}, "
+    cf.banner(f"Spatial constraint: CO-LOCALISATION ({args.coloc_metric}, "
               f"thr={args.coloc_threshold}, in >= {args.coloc_min_samples_frac:.2f} of samples)")
-    coloc = cc.colocalization_table(adata, cfg)
+    coloc = cf.colocalization_table(adata, sample_key=cfg.sample_key, celltype_key=cfg.groupby_col, spatial_key=cfg.spatial_key, n_neighs=cfg.n_neighs, metric=cfg.coloc_metric)
     if coloc.empty:
         warnings.warn("Co-localisation table is empty; skipping spatial filter.")
         return liana_res, coloc
 
     # per-(sample, source, target) flag
     samp_col = cfg.sample_key if cfg.sample_key in liana_res.columns else "sample"
-    coloc_key = coloc.set_index(["sample", "source", "target"])["colocalized"]
+    coloc_key = (coloc.set_index(["sample", "source", "target"])["value"]
+                 > cfg.coloc_threshold)
     keys = list(zip(liana_res[samp_col].astype(str),
                     liana_res["source"].astype(str),
                     liana_res["target"].astype(str)))
@@ -200,13 +207,13 @@ def apply_spatial_constraint(liana_res: pd.DataFrame, adata, cfg: cc.CCConfig, a
     print(f"  kept {len(filt)}/{before} per-sample L-R rows between co-localised pairs")
 
     # also report which pairs are *stably* co-localised (for the focused view)
-    stable = cc.stable_colocalized_pairs(coloc, cfg)
+    stable = cf.stable_colocalized_pairs(coloc, threshold=cfg.coloc_threshold, min_samples_frac=cfg.coloc_min_samples_frac)
     print(f"  {len(stable)} sender->receiver pairs co-localised in "
           f">= {cfg.coloc_min_samples_frac:.2f} of samples")
     return filt, coloc
 
 
-def build_and_decompose_tensor(liana_res: pd.DataFrame, cfg: cc.CCConfig, args,
+def build_and_decompose_tensor(liana_res: pd.DataFrame, cfg, args,
                                sample_to_condition: dict):
     """Build the 4D tensor with liana.multi.to_tensor_c2c and decompose it with
     Tensor-cell2cell.
@@ -214,7 +221,7 @@ def build_and_decompose_tensor(liana_res: pd.DataFrame, cfg: cc.CCConfig, args,
     import liana as li
     import cell2cell as c2c
 
-    cc.banner("Building 4D communication tensor (samples x LR x sender x receiver)")
+    cf.banner("Building 4D communication tensor (samples x LR x sender x receiver)")
     samp_col = cfg.sample_key if cfg.sample_key in liana_res.columns else "sample"
     build_kwargs = dict(
         liana_res=liana_res,
@@ -249,7 +256,7 @@ def build_and_decompose_tensor(liana_res: pd.DataFrame, cfg: cc.CCConfig, args,
         fill_with_order_elements=True,
     )
 
-    cc.banner("Tensor-cell2cell decomposition")
+    cf.banner("Tensor-cell2cell decomposition")
     if args.tensor_rank is None:
         print("  running elbow rank selection ...")
         # NB: tf_optimization is an R-wrapper concept, NOT a cell2cell kwarg.
@@ -285,33 +292,33 @@ def build_and_decompose_tensor(liana_res: pd.DataFrame, cfg: cc.CCConfig, args,
     return tensor, factors, context_df, meta, rank
 
 
-def test_factors_by_condition(context_df: pd.DataFrame, cfg: cc.CCConfig) -> pd.DataFrame:
+def test_factors_by_condition(context_df: pd.DataFrame, cfg) -> pd.DataFrame:
     """Mann-Whitney (TEST vs CNTRL) on each factor's context loadings."""
-    cc.banner("Comparing factor context-loadings: TEST vs CNTRL")
+    cf.banner("Comparing factor context-loadings: TEST vs CNTRL")
     factor_cols = [c for c in context_df.columns if c != cfg.condition_key]
     cond = context_df[cfg.condition_key].astype(str)
     rows = []
     for fc in factor_cols:
         b = context_df.loc[cond == cfg.cntrl, fc].values
         a = context_df.loc[cond == cfg.test, fc].values
-        res = cc.mannwhitney_test(b, a)
+        res = cf.mannwhitney_test(b, a)
         res["factor"] = fc
         res["direction"] = ("higher_in_TEST" if res["median_test"] >= res["median_cntrl"]
                             else "higher_in_CNTRL")
         rows.append(res)
     df = pd.DataFrame(rows).set_index("factor")
-    df["padj_BH"] = cc.bh_fdr(df["pvalue"].values)
-    df["stars"] = df["padj_BH"].map(cc.pval_stars)
+    df["padj_BH"] = cf.bh_fdr(df["pvalue"].values)
+    df["stars"] = df["padj_BH"].map(cf.pval_stars)
     df = df.sort_values("cliffs_delta", key=lambda s: s.abs(), ascending=False)
     return df[["n_cntrl", "n_test", "median_cntrl", "median_test", "cliffs_delta",
-               "U", "pvalue", "padj_BH", "stars", "direction"]]
+               "pvalue", "padj_BH", "stars", "direction"]]
 
 
-def focused_sender_receiver(liana_res: pd.DataFrame, cfg: cc.CCConfig, args,
+def focused_sender_receiver(liana_res: pd.DataFrame, cfg, args,
                             sample_to_condition: dict) -> pd.DataFrame:
     """Aggregate the focused sender->receiver interactions and compare CNTRL vs TEST,
     slide-as-unit. Returns one row per (ligand, receptor, source, target)."""
-    cc.banner("Focused sender -> receiver differential (slide-as-unit)")
+    cf.banner("Focused sender -> receiver differential (slide-as-unit)")
     senders = set(map(str, args.sender_celltypes)) or None
     receivers = set(map(str, args.receiver_celltypes)) or None
     samp_col = cfg.sample_key if cfg.sample_key in liana_res.columns else "sample"
@@ -341,7 +348,7 @@ def focused_sender_receiver(liana_res: pd.DataFrame, cfg: cc.CCConfig, args,
     for keys, sub in per_sample.groupby(grp_cols):
         b = sub.loc[sub["_cond"] == cfg.cntrl, "_strength"].values
         a = sub.loc[sub["_cond"] == cfg.test, "_strength"].values
-        res = cc.mannwhitney_test(b, a)
+        res = cf.mannwhitney_test(b, a)
         rec = dict(zip(grp_cols, keys))
         rec.update({
             "mean_strength_cntrl": np.nanmean(b) if b.size else np.nan,
@@ -353,17 +360,16 @@ def focused_sender_receiver(liana_res: pd.DataFrame, cfg: cc.CCConfig, args,
         rows.append(rec)
     out = pd.DataFrame(rows)
     if not out.empty:
-        out["padj_BH"] = cc.bh_fdr(out["pvalue"].values)
+        out["padj_BH"] = cf.bh_fdr(out["pvalue"].values)
         out["enriched_in"] = np.where(out["delta_test_minus_cntrl"] >= 0, cfg.test, cfg.cntrl)
         out = out.sort_values("delta_test_minus_cntrl", key=lambda s: s.abs(), ascending=False)
     return out
 
 
-# ---------------------------------------------------------------------------
+###############################################################################
 # Figures
-# ---------------------------------------------------------------------------
+###############################################################################
 def plot_factor_heatmaps(factors: dict, out_dir: str, top_n: int = 15):
-    plt = cc.set_plot_theme()
     import matplotlib.pyplot as _plt  # noqa
     for name, df in factors.items():
         if df.shape[0] > 60:
@@ -386,9 +392,8 @@ def plot_factor_heatmaps(factors: dict, out_dir: str, top_n: int = 15):
 
 
 def plot_context_boxplots(context_df: pd.DataFrame, factor_stats: pd.DataFrame,
-                          cfg: cc.CCConfig, out_dir: str):
-    plt = cc.set_plot_theme()
-    pal = cc.condition_palette(cfg)
+                          cfg, out_dir: str):
+    pal = cf.COND_COLORS
     factor_cols = [c for c in context_df.columns if c != cfg.condition_key]
     n = len(factor_cols)
     ncol = min(4, n); nrow = int(np.ceil(n / ncol))
@@ -413,10 +418,9 @@ def plot_context_boxplots(context_df: pd.DataFrame, factor_stats: pd.DataFrame,
     plt.close(fig)
 
 
-def plot_focused_dotplot(focused: pd.DataFrame, cfg: cc.CCConfig, out_dir: str, top: int = 30):
+def plot_focused_dotplot(focused: pd.DataFrame, cfg, out_dir: str, top: int = 30):
     if focused.empty:
         return
-    plt = cc.set_plot_theme()
     d = focused.head(top).copy()
     d["lr"] = d["ligand_complex"].astype(str) + " -> " + d["receptor_complex"].astype(str)
     d["sr"] = d["source"].astype(str) + "\n->" + d["target"].astype(str)
@@ -427,7 +431,7 @@ def plot_focused_dotplot(focused: pd.DataFrame, cfg: cc.CCConfig, out_dir: str, 
         x = srs.index(r["sr"]); y = lrs.index(r["lr"])
         size = 20 + 260 * (abs(r["delta_test_minus_cntrl"]) /
                            (d["delta_test_minus_cntrl"].abs().max() + 1e-9))
-        color = cc.condition_palette(cfg).get(r["enriched_in"], "gray")
+        color = cf.COND_COLORS.get(r["enriched_in"], "gray")
         ax.scatter(x, y, s=size, color=color, edgecolor="k", lw=0.3)
     ax.set_xticks(range(len(srs))); ax.set_xticklabels(srs, rotation=0, fontsize=6)
     ax.set_yticks(range(len(lrs))); ax.set_yticklabels(lrs, fontsize=6)
@@ -436,45 +440,55 @@ def plot_focused_dotplot(focused: pd.DataFrame, cfg: cc.CCConfig, out_dir: str, 
     plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
+###############################################################################
 def main():
     args = parse_args()
-    cfg = cc.config_from_args(args)
-    # pull spatial/tensor params into cfg
-    cfg.resource_name = args.resource
-    cfg.spatial_mode = args.spatial_mode
-    cfg.n_neighs = args.n_neighs
-    cfg.coloc_metric = args.coloc_metric
-    cfg.coloc_threshold = args.coloc_threshold
-    cfg.coloc_min_samples_frac = args.coloc_min_samples_frac
-    cfg.sender_celltypes = args.sender_celltypes
-    cfg.receiver_celltypes = args.receiver_celltypes
-    cfg.split_by_signature = args.split_by_signature
-    cfg.signature_pos_quantile = args.signature_pos_quantile
+    cf.apply_common_args(args)
 
-    out_dir = cc.ensure_out(cfg)
-    cc.banner("LOADING DATA")
-    adata = cc.load_adata(args.h5ad)
-    cfg = cc.resolve_keys(adata, cfg, require_niche=(args.spatial_mode == "within_niche"))
-    counts_layer = cc.resolve_counts_layer(adata, cfg)
+    # All resolved keys/labels live on the shared module; collect the per-run
+    # parameters into a lightweight namespace so the function bodies below keep
+    # reading cfg.<attr> unchanged.
+    cfg = argparse.Namespace(
+        cntrl=cf.CONDITION_CNTRL, test=cf.CONDITION_TEST,
+        celltype_key=cf.CELLTYPE_KEY, sample_key=cf.SAMPLE_KEY,
+        condition_key=cf.CONDITION_KEY, niche_key=cf.NICHE_KEY,
+        spatial_key=cf.SPATIAL_KEY, random_state=1337,
+        resource_name=args.resource, spatial_mode=args.spatial_mode,
+        n_neighs=args.n_neighs, coloc_metric=args.coloc_metric,
+        coloc_threshold=args.coloc_threshold,
+        coloc_min_samples_frac=args.coloc_min_samples_frac,
+        sender_celltypes=args.sender_celltypes,
+        receiver_celltypes=args.receiver_celltypes,
+        split_by_signature=args.split_by_condition,
+        signature_pos_quantile=cf.CONDITION_SCORE_QUANTILE,
+        groupby_col=cf.CELLTYPE_KEY,
+    )
+
+    out_dir = cf.ensure_out(args.output_dir or "communication_results")
+    cf.banner("LOADING DATA")
+    adata = cf.load_adata(args.h5ad, exclude_samples=cf.resolve_exclude(args))
+    counts_layer = cf.resolve_counts_layer(adata)
     print(f"  cells={adata.n_obs}  genes={adata.n_vars}")
     print(f"  keys: celltype={cfg.celltype_key} sample={cfg.sample_key} "
           f"condition={cfg.condition_key} niche={cfg.niche_key} spatial={cfg.spatial_key}")
     print(f"  counts layer = {counts_layer};  CNTRL={cfg.cntrl}  TEST={cfg.test}")
 
-    genes = cc.load_condition_genes(args.genes_path)
+    genes = list(cf.CONDITION_GENES)
     print(f"  condition genes loaded: {len(genes)}")
 
     # log-normalised working copy for LIANA (raw counts preserved in layer)
-    adata_ln = cc.make_lognorm_view(adata, cfg, counts_layer)
+    adata_ln = cf.make_lognorm_view(adata, counts_layer=counts_layer)
 
-    # optionally split groups by the signature (e.g. senescent vs not)
-    groupby = cfg.resolve_groupby()
+    # optionally split groups by condition (condition-high vs condition-low)
+    groupby = cf.CELLTYPE_KEY
     if cfg.split_by_signature and genes:
-        groupby = cc.add_signature_split(adata_ln, cfg, genes)
+        cf.compute_condition_score(adata_ln, gene_set=genes)
+        cf.add_condition_flag(adata_ln)
+        groupby = cf.condition_split_grouping(adata_ln, cfg.celltype_key)
         # mirror the split column onto the raw object too (used by spatial table)
         adata.obs[groupby] = adata_ln.obs[groupby].values
-        print(f"  signature split -> grouping on '{groupby}'")
+        print(f"  condition split -> grouping on '{groupby}'")
+    cfg.groupby_col = groupby
 
     # sample -> condition map
     s2c = (adata.obs[[cfg.sample_key, cfg.condition_key]].astype(str)
@@ -510,8 +524,8 @@ def main():
                        index=False)
 
     # 6) figures
-    cc.banner("WRITING FIGURES")
-    fig_dir = cc.ensure_out(cfg, "figures")
+    cf.banner("WRITING FIGURES")
+    fig_dir = os.path.join(out_dir, "figures")
     try:
         plot_factor_heatmaps(factors, fig_dir)
         plot_context_boxplots(context_df, factor_stats, cfg, fig_dir)
@@ -520,18 +534,18 @@ def main():
         warnings.warn(f"Figure generation issue: {e}")
 
     # report
-    cc.write_report(cfg, {
+    cf.write_report(out_dir, {
         "n_cells": int(adata.n_obs), "n_genes": int(adata.n_vars),
         "tensor_rank": int(rank), "tensor_shape": list(tensor.tensor.shape),
         "n_liana_rows_raw": int(len(liana_res)),
         "n_liana_rows_spatial": int(len(liana_filt)),
         "groupby": groupby,
         "n_focused_interactions": int(len(focused)),
-        "caveats": cc.CAVEATS,
-    }, "cellcell_communication_report.json")
+        "caveats": cf.CAVEATS,
+    }, "communication_report.json")
 
-    print(cc.CAVEATS)
-    cc.banner("DONE: cell-cell communication")
+    print(cf.CAVEATS)
+    cf.banner("DONE: cell-cell communication")
     print(f"Outputs in: {out_dir}")
     print("Hand 'focused_sender_receiver_interactions.csv' and 'liana_res_per_sample_spatial.csv' "
           "to analysis_condition_factor_roles.py.")
