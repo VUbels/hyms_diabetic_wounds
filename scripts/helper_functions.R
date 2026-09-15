@@ -1,24 +1,7 @@
 ################################################################################
-# helper_functions_proseg.R
+# helper_functions.R
 #
-# Proseg + Xenium spatial helper functions for Seurat v5.
-#
-# WORKFLOW:
-#   1. Run proseg -> proseg-output.zarr
-#   2. Python: proseg_to_seurat.py -> produces:
-#        proseg-anndata.h5ad           (counts + metadata + spatial coords)
-#        proseg-seg-vertices.csv.gz    (polygon vertices as x,y,cell table)
-#        proseg-centroids.csv.gz       (cell centroids)
-#   3. R: load_proseg_h5ad()           (Seurat object with counts + metadata)
-#   4. R: attach_proseg_fov()          (native FOV with segmentation + centroids)
-#   5. R: attach_xenium_fov()          (Xenium boundaries as second FOV)
-#
-# After this, ImageDimPlot, ImageFeaturePlot, Crop, DefaultBoundary all work.
-#
-# REQUIREMENTS:
-#   - anndataR + rhdf5 (for h5ad reading)
-#   - SeuratObject >= 5.0.0, Seurat >= 5.0.0
-#   - arrow, dplyr (for Xenium parquet files)
+# Proseg + Xenium spatial analysis helpers for Seurat v5.
 ################################################################################
 
 library(data.table)
@@ -38,16 +21,197 @@ library(ggplot2)
 library(sf)
 library(patchwork)
 library(viridis)
-library(BiocParallel) 
+library(BiocParallel)
 library(ggpmisc)
 library(future)
 library(BPCells)
+library(cowplot)
+library(gridExtra)
+library(scales)
 
-options(future.globals.maxSize = 4 * 1024^3)
+options(future.globals.maxSize = 200 * 1024^3)
+Assays <- SeuratObject::Assays
 
-################################################################################
-# Load proseg h5ad -> Seurat object (counts + metadata, no FOV yet)
-################################################################################
+#######################################################################
+#######################################################################
+#                                                                     #
+#                         SETUP AND UTILITIES                         #
+#                                                                     #
+#######################################################################
+#######################################################################
+
+#CONTENTS: timestamps, logging, default palette, coordinate column resolution
+
+#TIMESTAMP PREFIX FOR CONSOLE OUTPUT
+.ts <- function() format(Sys.time(), "[%Y-%m-%d %H:%M:%S]")
+
+#MESSAGE LOGGER
+log_msg <- function(...) {
+  cat(format(Sys.time(), "[%Y-%m-%d %H:%M:%S]"), paste0(...), "\n")
+}
+
+#FALLBACK PALETTE WHEN NO CONTRAST PALETTE IS AVAILABLE
+default_palette <- c(
+  "#2166AC", "#D62728", "#2CA02C", "#FF7F0E", "#9467BD", "#17BECF",
+  "#E377C2", "#8C564B", "#BCBD22", "#1F77B4", "#AEC7E8", "#FFBB78",
+  "#98DF8A", "#FF9896", "#C5B0D5", "#C49C94", "#F7B6D2", "#DBDB8D",
+  "#9EDAE5", "#393B79", "#637939", "#8C6D31", "#843C39", "#7B4173",
+  "#5254A3", "#6B6ECF", "#9C9EDE", "#E7BA52", "#BD9E39", "#AD494A",
+  "#D6616B", "#CE6DBD", "#DE9ED6", "#3182BD", "#6BAED6", "#E6550D",
+  "#FD8D3C", "#31A354", "#74C476", "#756BB1", "#FDAE6B", "#A1D99B",
+  "#DADAEB", "#636363", "#969696", "#525252", "#FDD0A2", "#C7E9C0"
+)
+
+#RESOLVE A COORDINATE COLUMN FROM ALTERNATIVE NAMES
+resolve_coord_col <- function(meta_colnames, preferred, alternatives) {
+  if (preferred %in% meta_colnames) return(preferred)
+  for (alt in alternatives) {
+    if (alt %in% meta_colnames) return(alt)
+  }
+  return(preferred)  # fall through, will be caught later
+}
+
+#######################################################################
+#######################################################################
+#                                                                     #
+#                          COHORT DEFINITION                          #
+#                                                                     #
+#######################################################################
+#######################################################################
+
+#CONTENTS: sample sheet, regions list, region checks, centroid accessor
+
+######################################
+# SAMPLE SHEET                       #
+######################################
+
+#read the cohort definition: sample_id,condition,proseg_dir
+read_sample_sheet <- function(path = "samples.csv", verbose = TRUE) {
+
+  if (!file.exists(path)) stop("sample sheet not found: ", path)
+  sheet <- data.table::fread(path, data.table = FALSE,
+                             colClasses = "character")
+
+  required <- c("sample_id", "condition", "proseg_dir")
+  missing  <- setdiff(required, colnames(sheet))
+  if (length(missing))
+    stop("sample sheet missing column(s): ", paste(missing, collapse = ", "))
+  if (anyDuplicated(sheet$sample_id))
+    stop("duplicate sample_id in ", path)
+  if (any(grepl("[^A-Za-z0-9._-]", sheet$sample_id)))
+    stop("sample_id must contain only [A-Za-z0-9._-]")
+
+  rownames(sheet) <- sheet$sample_id
+  if (verbose)
+    cat(.ts(), " sample sheet:", nrow(sheet), "samples |",
+        paste(names(table(sheet$condition)), table(sheet$condition),
+              sep = "=", collapse = " "), "\n")
+  sheet
+}
+
+#build the regions list from the sample sheet
+regions_from_sheet <- function(sheet,
+                               rds_name = "{sample_id}_proseg_seurat.rds",
+                               require_exists = TRUE) {
+
+  regions <- lapply(seq_len(nrow(sheet)), function(i) {
+    sample_id <- sheet$sample_id[i]
+    list(sample_id = sample_id,
+         condition = sheet$condition[i],
+         dir       = sheet$proseg_dir[i],
+         rds_path  = file.path(sheet$proseg_dir[i],
+                               gsub("{sample_id}", sample_id, rds_name,
+                                    fixed = TRUE)))
+  })
+  names(regions) <- sheet$sample_id
+
+  if (require_exists) {
+    missing <- names(regions)[!vapply(regions, function(region)
+      file.exists(region$rds_path), logical(1))]
+    if (length(missing))
+      stop("object not built for: ", paste(missing, collapse = ", "))
+  }
+  regions
+}
+
+#check every region object before any expensive work
+check_proseg_regions <- function(regions, verbose = TRUE) {
+
+  report <- lapply(names(regions), function(sample_id) {
+    obj    <- readRDS(regions[[sample_id]]$rds_path)
+    issues <- character(0)
+
+    if (!"RNA" %in% Assays(obj)) issues <- c(issues, "no RNA assay")
+    if (anyDuplicated(colnames(obj))) issues <- c(issues, "duplicate cell names")
+    if (!length(Images(obj))) issues <- c(issues, "no FOV")
+    if (length(Images(obj))) {
+      coords <- proseg_coords(obj)
+      if (is.null(coords)) issues <- c(issues, "no centroids boundary")
+      else if (nrow(coords) != ncol(obj))
+        issues <- c(issues, "centroids do not cover all cells")
+    }
+
+    result <- data.frame(sample_id = sample_id, n_cells = ncol(obj),
+                         n_genes = nrow(obj), n_fov = length(Images(obj)),
+                         issues = paste(issues, collapse = " | "),
+                         stringsAsFactors = FALSE)
+    rm(obj); gc(verbose = FALSE)
+    result
+  })
+  report <- do.call(rbind, report)
+
+  if (verbose) {
+    print(report)
+    failed <- report[nzchar(report$issues), ]
+    if (nrow(failed)) warning("regions with issues: ",
+                              paste(failed$sample_id, collapse = ", "))
+  }
+  invisible(report)
+}
+
+#per-cell centroids, one row per cell, in microns
+proseg_coords <- function(obj, fov = NULL, cells = NULL) {
+
+  if (!length(Images(obj))) return(NULL)
+  fov <- fov %||% Images(obj)[1]
+
+  coords <- tryCatch(
+    GetTissueCoordinates(obj, image = fov, which = "centroids"),
+    error = function(e) NULL)
+  if (is.null(coords) || !nrow(coords)) return(NULL)
+
+  ids <- if ("cell" %in% colnames(coords)) as.character(coords$cell) else
+    rownames(coords)
+
+  #segmentation boundaries give one row per vertex
+  if (anyDuplicated(ids)) {
+    coords <- data.table::as.data.table(
+      list(cell = ids, x = coords$x, y = coords$y))[
+        , .(x = mean(x), y = mean(y)), by = cell]
+    ids    <- coords$cell
+    coords <- data.frame(x = coords$x, y = coords$y)
+  } else {
+    coords <- data.frame(x = coords$x, y = coords$y)
+  }
+
+  rownames(coords) <- ids
+  if (!is.null(cells)) coords <- coords[intersect(cells, ids), , drop = FALSE]
+  coords
+}
+
+#######################################################################
+#######################################################################
+#                                                                     #
+#                      PROSEG OBJECT CONSTRUCTION                     #
+#                                                                     #
+#######################################################################
+#######################################################################
+
+#CONTENTS: h5ad loading, FOV attachment, per-region object building
+
+######################################
+# LOAD PROSEG H5AD                   #
+######################################
 
 load_proseg_h5ad <- function(h5ad_path) {
   
@@ -76,17 +240,11 @@ load_proseg_h5ad <- function(h5ad_path) {
   return(seu)
 }
 
+######################################
+# ATTACH FOVS                        #
+######################################
 
-################################################################################
-# Attach proseg segmentation as native FOV
-#
-# Reads the vertex CSV produced by proseg_to_seurat.py.
-# Format: x, y, cell (one row per vertex, cell name repeated).
-# This is exactly what CreateSegmentation.data.frame() expects.
-#
-# Also reads centroids CSV or computes from metadata.
-################################################################################
-
+#PROSEG SEGMENTATION AND CENTROIDS AS A NATIVE FOV
 attach_proseg_fov <- function(seu,
                               vertices_csv_path,
                               centroids_csv_path = NULL,
@@ -153,16 +311,7 @@ attach_proseg_fov <- function(seu,
   return(seu)
 }
 
-
-################################################################################
-# Attach Xenium boundaries as a native FOV
-#
-# Reads cell_boundaries.parquet from original Xenium output.
-# Converts to vertex data.frame and creates a proper FOV.
-#
-# Cell name mapping: Xenium cell_id -> proseg original_cell_id -> colnames(seu)
-################################################################################
-
+#XENIUM CELL BOUNDARIES AS A SECOND FOV
 attach_xenium_fov <- function(seu,
                               xenium_dir,
                               fov_name = "xenium",
@@ -295,11 +444,7 @@ attach_xenium_fov <- function(seu,
   return(seu)
 }
 
-
-###############################################################################
-# Attach Xenium nuclei as additional boundary within existing FOV
-################################################################################
-
+#XENIUM NUCLEUS BOUNDARIES AS A THIRD FOV
 attach_xenium_nuclei <- function(seu,
                                  xenium_dir,
                                  fov_name = "xenium",
@@ -351,11 +496,11 @@ attach_xenium_nuclei <- function(seu,
   return(seu)
 }
 
+######################################
+# BUILD REGION OBJECTS               #
+######################################
 
-################################################################################
-# CONVENIENCE: Full proseg load in one call - For segmentation comparison
-################################################################################
-
+#COUNTS PLUS ALL AVAILABLE FOVS FOR ONE REGION
 load_proseg_full <- function(h5ad_path,
                              vertices_csv_path,
                              centroids_csv_path = NULL,
@@ -382,10 +527,7 @@ load_proseg_full <- function(h5ad_path,
   return(seu)
 }
 
-################################################################################
-# LOAD AND OUTPUT A PREFORMATTED SEURAT.RDS AFTER PROSEG COMPUTATION
-################################################################################
-
+#CONVERT EVERY PROSEG ZARR OUTPUT INTO A SEURAT OBJECT
 build_proseg_seurat <- function(proseg_dir,
                                 xenium_dir,
                                 resolution = 0.7,
@@ -486,10 +628,1830 @@ build_proseg_seurat <- function(proseg_dir,
   }
 }
 
+#######################################################################
+#######################################################################
+#                                                                     #
+#                           QUALITY CONTROL                           #
+#                                                                     #
+#######################################################################
+#######################################################################
+
+#CONTENTS: assay cleaning, count and feature filters, doublet removal, h5 loading
+
+#DROP DERIVED LAYERS AND REDUCTIONS FROM AN ASSAY
+ensure_clean_assay <- function(obj, nm) {
+  
+  # Force default assay to RNA
+  if (DefaultAssay(obj) != "RNA") {
+    log_msg(nm, " | Switching default assay from '",
+            DefaultAssay(obj), "' to 'RNA'")
+    DefaultAssay(obj) <- "RNA"
+  }
+  
+  available <- Layers(obj[["RNA"]])
+  
+  # If counts layer is missing, try to recover
+  if (!"counts" %in% available) {
+    
+    # Some v3/v4 -> v5 conversions store raw counts under "data"
+    if ("data" %in% available) {
+      log_msg(nm, " | No 'counts' layer found; copying 'data' -> 'counts'")
+      obj[["RNA"]]$counts <- LayerData(obj[["RNA"]], layer = "data")
+    } else {
+      # Check for split layers (counts.X, counts.Y, ...)
+      split_counts <- grep("^counts\\.", available, value = TRUE)
+      if (length(split_counts) > 0) {
+        log_msg(nm, " | Found split count layers (",
+                paste(split_counts, collapse = ", "),
+                "); joining...")
+        obj[["RNA"]] <- JoinLayers(obj[["RNA"]])
+      } else {
+        stop("[", nm, "] RNA assay has no 'counts' layer and no recoverable ",
+             "alternative. Available layers: ",
+             paste(available, collapse = ", "))
+      }
+    }
+  }
+  
+  log_msg(nm, " | RNA layers: ",
+          paste(Layers(obj[["RNA"]]), collapse = ", "))
+  
+  return(obj)
+}
+
+#FILTER CELLS ON COUNTS, FEATURES AND MITOCHONDRIAL FRACTION
+qc_filter <- function(obj, config, nm) {
+  
+  n_before <- ncol(obj)
+  
+  # Compute percent.mt if not already present
+  if (!"percent.mt" %in% colnames(obj@meta.data)) {
+    obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-|^mt-")
+  }
+  
+  # Apply filters
+  keep <- obj$nFeature_RNA >= config$min_genes &
+    obj$nFeature_RNA <= config$max_genes &
+    obj$percent.mt   <= config$max_mt_pct
+  
+  n_remove <- sum(!keep)
+  
+  if (n_remove > 0) {
+    obj <- subset(obj, cells = colnames(obj)[keep])
+  }
+  
+  log_msg(nm, " | QC: ", n_before, " -> ", ncol(obj), " cells ",
+          "(removed ", n_remove, "; genes [", config$min_genes, "-",
+          config$max_genes, "], MT <= ", config$max_mt_pct, "%)")
+  
+  return(obj)
+}
+
+#REMOVE DOUBLETS PER BATCH
+remove_doublets <- function(obj, batch_col, nm) {
+  
+  n_before <- ncol(obj)
+  
+  # Convert to SCE for scDblFinder
+  sce <- as.SingleCellExperiment(obj)
+  
+  # Run scDblFinder; if batch_col has only 1 level, don't pass samples
+  batches <- obj@meta.data[[batch_col]]
+  n_batches <- length(unique(batches))
+  
+  if (n_batches > 1) {
+    sce <- scDblFinder(sce, samples = batch_col)
+  } else {
+    sce <- scDblFinder(sce)
+  }
+  
+  # Transfer calls back to Seurat
+  obj$scDblFinder.class <- sce$scDblFinder.class
+  obj$scDblFinder.score <- sce$scDblFinder.score
+  
+  n_doublets <- sum(obj$scDblFinder.class == "doublet")
+  
+  # Remove doublets
+  obj <- subset(obj, scDblFinder.class == "singlet")
+  
+  log_msg(nm, " | Doublets: ", n_doublets, " / ", n_before,
+          " (", round(100 * n_doublets / n_before, 1), "%) removed -> ",
+          ncol(obj), " cells")
+  
+  return(obj)
+}
+
+#LOAD A CELLRANGER H5 INTO A SEURAT OBJECT
+load_h5_to_seurat <- function(h5_path, sample_name) {
+  
+  counts <- Read10X_h5(h5_path)
+  
+  # Read10X_h5 returns a list when multiple modalities exist (e.g. GEX + ADT)
+  # Take Gene Expression if so
+  if (is.list(counts)) {
+    if ("Gene Expression" %in% names(counts)) {
+      counts <- counts[["Gene Expression"]]
+    } else {
+      counts <- counts[[1]]
+    }
+  }
+  
+  obj <- CreateSeuratObject(
+    counts       = counts,
+    project      = sample_name,
+    min.cells    = 0,
+    min.features = 0
+  )
+  
+  obj$sample_name <- sample_name
+  
+  return(obj)
+}
+
+#PARSE A SAMPLE NAME FROM AN H5 FILENAME
+sample_name_from_h5 <- function(filename) {
+  
+  name <- sub("\\.h5$", "", filename)
+  
+  stripped <- sub("_?filtered_feature_bc_matrix$", "", name)
+  stripped <- sub("_?raw_feature_bc_matrix$", "", stripped)
+  
+  if (nchar(stripped) == 0) {
+    return(name)
+  }
+  
+  return(stripped)
+}
 
 #######################################################################
-# SIMPLE ANNOTATION
 #######################################################################
+#                                                                     #
+#                       SKETCH BASED ANNOTATION                       #
+#                                                                     #
+#######################################################################
+#######################################################################
+
+#CONTENTS: merge regions, sketch, cluster, markers, manual labels, projection
+
+######################################
+# MERGE PROSEG REGIONS               #
+######################################
+
+#merge all regions into one object, keeping segmentation FOVs
+merge_proseg_regions <- function(regions,
+                                 sample_sheet = NULL,
+                                 min_counts   = 10,
+                                 on_disk      = FALSE,
+                                 on_disk_dir  = "./bpcells_counts",
+                                 sample_col   = "sample_id",
+                                 verbose      = TRUE) {
+
+  object_list <- list()
+
+  for (sample_id in names(regions)) {
+
+    if (verbose) cat(.ts(), " reading", sample_id, "\n")
+    obj <- readRDS(regions[[sample_id]]$rds_path)
+    DefaultAssay(obj) <- "RNA"
+
+    #drop low-count cells before merging
+    counts <- LayerData(obj, assay = "RNA", layer = "counts")
+    keep   <- colnames(obj)[Matrix::colSums(counts) >= min_counts]
+    if (length(keep) < ncol(obj)) obj <- subset(obj, cells = keep)
+    rm(counts)
+
+    #prefix cell names so they are unique across the cohort
+    obj$proseg_cell_id <- colnames(obj)
+    new_names <- paste0(sample_id, "_", colnames(obj))
+    
+    #detach FOVs, rename object and boundaries separately, reattach as one
+    #FOV named after the region. RenameCells on the object does not
+    #propagate into boundary cell names.
+    fov_list <- Images(obj)
+    boundaries <- list()
+    for (fov in fov_list) {
+      boundaries[[fov]] <- obj[[fov]]
+      obj[[fov]] <- NULL
+    }
+    
+    obj <- RenameCells(obj, new.names = new_names)
+    
+    if (length(boundaries)) {
+      fov <- boundaries[[1]]
+      fov <- RenameCells(fov, new.names = paste0(sample_id, "_", Cells(fov)))
+      DefaultAssay(fov) <- "RNA"
+      obj[[sample_id]] <- fov
+    }
+
+    obj[[sample_col]] <- sample_id
+    condition <- regions[[sample_id]]$condition
+    if (is.null(condition) && !is.null(sample_sheet))
+      condition <- sample_sheet[sample_id, "condition"]
+    obj$condition <- if (is.null(condition)) NA_character_ else condition
+
+    if (verbose) cat(.ts(), "  ", ncol(obj), "cells |", length(Images(obj)),
+                     "FOV\n")
+    object_list[[sample_id]] <- obj
+  }
+
+  if (verbose) cat(.ts(), " merging\n")
+  obj <- if (length(object_list) == 1) object_list[[1]] else
+    merge(x = object_list[[1]], y = object_list[-1])
+  rm(object_list); gc(verbose = FALSE)
+
+  obj[["RNA"]] <- JoinLayers(obj[["RNA"]])
+
+  if (on_disk) {
+    if (verbose) cat(.ts(), " writing counts to", on_disk_dir, "\n")
+    dir.create(dirname(on_disk_dir), recursive = TRUE, showWarnings = FALSE)
+    BPCells::write_matrix_dir(
+      mat = LayerData(obj, assay = "RNA", layer = "counts"),
+      dir = on_disk_dir, overwrite = TRUE)
+    LayerData(obj, assay = "RNA", layer = "counts") <-
+      BPCells::open_matrix_dir(dir = on_disk_dir)
+    gc(verbose = FALSE)
+  }
+
+  #split by region so sketching draws a fixed number of cells per region
+  obj[["RNA"]] <- split(obj[["RNA"]], f = obj@meta.data[[sample_col]])
+
+  if (verbose) {
+    cat(.ts(), " merged:", ncol(obj), "cells,", nrow(obj), "genes\n")
+    cat(.ts(), " FOVs:", paste(Images(obj), collapse = ", "), "\n")
+  }
+  obj
+}
+
+
+######################################
+# SKETCH                             #
+######################################
+
+#hvg selection with a dispersion fallback for fractional proseg counts
+find_variable_features_safe <- function(obj, assay = NULL, n_features = 2000) {
+
+  assay   <- assay %||% DefaultAssay(obj)
+  warnings_seen <- NULL
+
+  obj <- withCallingHandlers(
+    FindVariableFeatures(obj, assay = assay, nfeatures = n_features,
+                         verbose = FALSE),
+    warning = function(w) {
+      warnings_seen <<- c(warnings_seen, conditionMessage(w))
+      invokeRestart("muffleWarning")
+    })
+
+  degenerate <- FALSE
+  tryCatch({
+    hvf <- HVFInfo(obj, assay = assay, method = "vst")
+    if ("variance.standardized" %in% colnames(hvf))
+      degenerate <- sum(is.nan(hvf$variance.standardized)) > 0.5 * nrow(hvf)
+  }, error = function(e)
+    degenerate <<- any(grepl("NaN", warnings_seen, fixed = TRUE)))
+
+  if (degenerate) {
+    cat(.ts(), " vst degenerate, using dispersion\n")
+    obj <- FindVariableFeatures(obj, assay = assay, nfeatures = n_features,
+                                selection.method = "dispersion",
+                                verbose = FALSE)
+  }
+  obj
+}
+
+#add a sketch assay holding a fixed number of cells per region
+sketch_proseg_object <- function(obj,
+                                 sketch_cells   = 20000,
+                                 method         = c("leverage", "uniform"),
+                                 n_features     = 2000,
+                                 score_features = 4000,
+                                 sketch_assay   = "sketch",
+                                 seed           = 123,
+                                 verbose        = TRUE) {
+
+  method <- match.arg(method)
+  DefaultAssay(obj) <- "RNA"
+
+  obj <- NormalizeData(obj, verbose = FALSE)
+  obj <- find_variable_features_safe(obj, "RNA", n_features)
+
+  #LeverageScore aborts above 5000 features, so cap the scoring features
+  features <- head(VariableFeatures(obj), score_features)
+  if (verbose) cat(.ts(), " sketching", sketch_cells, "cells per region on",
+                   length(features), "features\n")
+
+  obj <- SketchData(
+    object         = obj,
+    ncells         = sketch_cells,
+    method         = if (method == "leverage") "LeverageScore" else "Uniform",
+    sketched.assay = sketch_assay,
+    features       = features,
+    seed           = seed,
+    verbose        = FALSE)
+
+  DefaultAssay(obj) <- sketch_assay
+  obj[[sketch_assay]] <- JoinLayers(obj[[sketch_assay]])
+
+  if (verbose) cat(.ts(), " sketch assay:", ncol(obj[[sketch_assay]]),
+                   "cells\n")
+  obj
+}
+
+
+######################################
+# CLUSTER SKETCH                     #
+######################################
+
+#cluster the sketch assay and record cluster labels
+cluster_sketch <- function(obj,
+                           dims         = 1:30,
+                           resolutions  = c(0.3, 0.5, 0.8, 1.2),
+                           resolution   = 0.5,
+                           n_features   = 2000,
+                           integrate    = FALSE,
+                           sample_col   = "sample_id",
+                           sketch_assay = "sketch",
+                           cluster_col  = "sketch_cluster",
+                           verbose      = TRUE) {
+
+  DefaultAssay(obj) <- sketch_assay
+
+  obj <- NormalizeData(obj, assay = sketch_assay, verbose = FALSE)
+  obj <- find_variable_features_safe(obj, sketch_assay, n_features)
+
+  counts   <- LayerData(obj, assay = sketch_assay, layer = "counts")
+  detected <- rownames(counts)[Matrix::rowSums(counts) > 0]
+  features <- intersect(VariableFeatures(obj, assay = sketch_assay), detected)
+  rm(counts)
+
+  if (verbose) cat(.ts(), " pca on", length(features), "features\n")
+  obj <- ScaleData(obj, assay = sketch_assay, features = features,
+                   verbose = FALSE)
+  obj <- RunPCA(obj, assay = sketch_assay, features = features,
+                npcs = max(50, max(dims)), verbose = FALSE)
+
+  reduction <- "pca"
+  if (integrate) {
+    if (!requireNamespace("harmony", quietly = TRUE))
+      stop("integrate = TRUE requires harmony")
+    if (verbose) cat(.ts(), " harmony on", sample_col, "\n")
+    obj <- harmony::RunHarmony(obj, group.by.vars = sample_col,
+                               reduction.use = "pca",
+                               reduction.save = "harmony",
+                               assay.use = sketch_assay, verbose = FALSE)
+    reduction <- "harmony"
+  }
+
+  obj <- FindNeighbors(obj, reduction = reduction, dims = dims,
+                       verbose = FALSE)
+  obj <- FindClusters(obj, resolution = resolutions, verbose = FALSE)
+  obj <- RunUMAP(obj, reduction = reduction, dims = dims,
+                 reduction.name = "umap", return.model = TRUE,
+                 verbose = FALSE)
+
+  obj <- set_sketch_resolution(obj, resolution, sketch_assay, cluster_col,
+                               verbose = verbose)
+
+  #report whether clusters are region specific
+  composition <- prop.table(
+    table(obj@meta.data[[cluster_col]], obj@meta.data[[sample_col]]), 1)
+  region_specific <- sum(apply(composition, 1, max) > 0.8)
+  if (verbose)
+    cat(.ts(), " clusters >80% from one region:", region_specific, "of",
+        nrow(composition), "\n")
+
+  obj
+}
+
+#switch to a precomputed clustering resolution
+set_sketch_resolution <- function(obj, resolution, sketch_assay = "sketch",
+                                  cluster_col = "sketch_cluster",
+                                  verbose = TRUE) {
+
+  column <- paste0(sketch_assay, "_snn_res.", resolution)
+  if (!column %in% colnames(obj@meta.data)) {
+    obj <- FindClusters(obj, resolution = resolution, verbose = FALSE)
+    column <- grep(paste0("_snn_res\\.", resolution, "$"),
+                   colnames(obj@meta.data), value = TRUE)[1]
+  }
+  obj@meta.data[[cluster_col]] <- as.character(obj@meta.data[[column]])
+  Idents(obj) <- cluster_col
+  if (verbose)
+    cat(.ts(), " resolution", resolution, "->",
+        length(unique(obj@meta.data[[cluster_col]])), "clusters\n")
+  obj
+}
+
+
+######################################
+# CLUSTER MARKERS                    #
+######################################
+
+#markers per sketch cluster
+sketch_cluster_markers <- function(obj,
+                                   cluster_col  = "sketch_cluster",
+                                   sketch_assay = "sketch",
+                                   output_dir   = "./annotated_data",
+                                   only_pos     = TRUE,
+                                   min_pct      = 0.1,
+                                   logfc        = 0.25,
+                                   format       = "csv",
+                                   cache        = TRUE) {
+
+  dir  <- file.path(output_dir, "_sketch")
+  file <- paste0("markers_", cluster_col)
+  path <- file.path(dir, paste0(file, ".csv"))
+  dir.create(dir, recursive = TRUE, showWarnings = FALSE)
+
+  if (cache && file.exists(path)) {
+    cat(.ts(), " cached markers:", path, "\n")
+    return(data.table::fread(path, data.table = FALSE))
+  }
+
+  DefaultAssay(obj) <- sketch_assay
+  Idents(obj) <- cluster_col
+  markers <- FindAllMarkers(obj, assay = sketch_assay, group.by = cluster_col,
+                            only.pos = only_pos,
+                            min.pct = min_pct, logfc.threshold = logfc,
+                            verbose = FALSE)
+
+  written <- .write_markers(markers, dir, file, format = format)
+  cat(.ts(), " markers:", paste(written, collapse = ", "), "\n")
+  markers
+}
+
+#top n markers per cluster as a named list
+top_cluster_markers <- function(markers, n = 15, order_by = "avg_log2FC") {
+  markers <- markers[order(markers$cluster, -markers[[order_by]]), ]
+  lapply(split(markers$gene, markers$cluster), head, n)
+}
+
+
+######################################
+# MANUAL ANNOTATION                  #
+######################################
+
+#write a csv with one row per cluster for manual labelling
+write_cluster_template <- function(obj,
+                                   markers     = NULL,
+                                   cluster_col = "sketch_cluster",
+                                   n_genes     = 15,
+                                   output_dir  = "./annotated_data",
+                                   path        = NULL) {
+
+  path <- path %||% file.path(output_dir, "_sketch", "cluster_annotation.csv")
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+
+  clusters <- sort(unique(as.character(obj@meta.data[[cluster_col]])))
+  counts   <- table(as.character(obj@meta.data[[cluster_col]]))
+  top      <- if (!is.null(markers)) top_cluster_markers(markers, n_genes)
+
+  template <- data.frame(
+    cluster   = clusters,
+    n_cells   = as.integer(counts[clusters]),
+    top_genes = vapply(clusters, function(cluster)
+      if (is.null(top[[cluster]])) "" else
+        paste(top[[cluster]], collapse = ", "), character(1)),
+    cell_type = "",
+    stringsAsFactors = FALSE)
+
+  data.table::fwrite(template, path)
+  cat(.ts(), " fill the cell_type column of:", path, "\n")
+  invisible(template)
+}
+
+#read a completed template as a named vector
+read_cluster_template <- function(output_dir = "./annotated_data",
+                                  path       = NULL,
+                                  label_col  = "cell_type") {
+
+  path <- path %||% file.path(output_dir, "_sketch", "cluster_annotation.csv")
+  template <- data.table::fread(path, data.table = FALSE)
+  if (any(is.na(template[[label_col]]) | template[[label_col]] == ""))
+    stop("unfilled rows in ", path)
+  setNames(as.character(template[[label_col]]), as.character(template$cluster))
+}
+
+#apply cluster labels to the sketch cells
+label_sketch_clusters <- function(obj,
+                                  labels      = NULL,
+                                  cluster_col = "sketch_cluster",
+                                  label_col   = "cell_type",
+                                  output_dir  = "./annotated_data",
+                                  template    = NULL,
+                                  verbose     = TRUE) {
+
+  if (is.null(labels))
+    labels <- read_cluster_template(output_dir, template)
+  if (is.list(labels)) labels <- unlist(labels)
+
+  clusters <- as.character(obj@meta.data[[cluster_col]])
+  missing  <- setdiff(unique(na.omit(clusters)), names(labels))
+  if (length(missing))
+    stop("no label for cluster(s): ", paste(missing, collapse = ", "))
+
+  obj@meta.data[[label_col]] <- unname(labels[clusters])
+  Idents(obj) <- label_col
+
+  if (verbose) print(sort(table(obj@meta.data[[label_col]]), decreasing = TRUE))
+  obj
+}
+
+zoom_region <- function(obj, fov, x, y, features = NULL,
+                        group_col = "cell_type", colours = NULL,
+                        size = 1.5, flip_xy = TRUE) {
+  
+  obj[["zoom_tmp"]] <- Crop(obj[[fov]], x = x, y = y, coords = "tissue")
+  n <- length(Cells(obj[["zoom_tmp"]]))
+  cat("cells in window:", n, "\n")
+  if (n == 0) stop("empty window, check the bbox")
+  
+  plot <- if (is.null(features)) {
+    ImageDimPlot(obj, fov = "zoom_tmp", group.by = group_col,
+                 cols = colours, size = size, border.color = NA,
+                 border.size = 0, flip_xy = flip_xy)
+  } else {
+    ImageFeaturePlot(obj, fov = "zoom_tmp", features = features,
+                     size = size, border.color = NA, border.size = 0)
+  }
+  plot
+}
+
+######################################
+# PROJECT LABELS TO ALL CELLS        #
+######################################
+
+#extend sketch labels and embeddings to every cell in the full assay
+project_sketch_labels <- function(obj,
+                                  label_col    = "cell_type",
+                                  assay        = "RNA",
+                                  sketch_assay = "sketch",
+                                  dims         = 1:30,
+                                  k_weight     = 50,
+                                  verbose      = TRUE) {
+
+  if (!label_col %in% colnames(obj@meta.data))
+    stop(label_col, " not found, run label_sketch_clusters() first")
+
+  #Seurat's CreateCategoryMatrix() rewrites underscores to dashes in
+  #identity names, and TransferLablesNN() reads predicted labels straight
+  #off those column names, so "Mural_Muscle" comes back "Mural-Muscle" and
+  #splits into two compartments. keep the originals to map them back.
+  originals <- unique(na.omit(as.character(obj@meta.data[[label_col]])))
+  mangled   <- gsub("_", "-", originals)
+  if (anyDuplicated(mangled))
+    warning("labels differing only in _ vs - cannot be told apart after ",
+            "projection: ",
+            paste(originals[duplicated(mangled) | duplicated(mangled,
+                  fromLast = TRUE)], collapse = ", "))
+
+  DefaultAssay(obj) <- sketch_assay
+  refdata <- setNames(list(label_col), paste0(label_col, "_projected"))
+
+  if (verbose) cat(.ts(), " projecting to", ncol(obj[[assay]]), "cells\n")
+  obj <- ProjectData(
+    object             = obj,
+    assay              = assay,
+    full.reduction     = "pca.full",
+    sketched.assay     = sketch_assay,
+    sketched.reduction = "pca",
+    umap.model         = "umap",
+    dims               = dims,
+    refdata            = refdata,
+    k.weight           = k_weight,
+    verbose            = FALSE)
+
+  #single label column covering every cell
+  projected <- paste0(label_col, "_projected")
+
+  #undo the underscore to dash rewrite described above
+  lookup  <- setNames(originals, mangled)
+  guessed <- as.character(obj@meta.data[[projected]])
+  hit     <- !is.na(guessed) & guessed %in% names(lookup)
+  guessed[hit] <- unname(lookup[guessed[hit]])
+  obj@meta.data[[projected]] <- guessed
+
+  full_labels <- obj@meta.data[[projected]]
+  sketch_labels <- as.character(obj@meta.data[[label_col]])
+  full_labels[!is.na(sketch_labels)] <- sketch_labels[!is.na(sketch_labels)]
+  obj@meta.data[[label_col]] <- full_labels
+
+  DefaultAssay(obj) <- assay
+  Idents(obj) <- label_col
+
+  if (verbose) {
+    cat(.ts(), " labelled:", sum(!is.na(obj@meta.data[[label_col]])), "of",
+        ncol(obj), "cells\n")
+    print(sort(table(obj@meta.data[[label_col]]), decreasing = TRUE))
+  }
+  obj
+}
+
+#######################################################################
+#######################################################################
+#                                                                     #
+#                        TWO LEVEL ANNOTATION                         #
+#                                                                     #
+#######################################################################
+#######################################################################
+
+#CONTENTS: subsetting a broad compartment, reclustering it, and folding the
+#fine labels back into the parent object. Labels can be supplied either as
+#named vectors in the calling script or as filled csv templates on disk.
+
+######################################
+# PATHS                              #
+######################################
+
+subcluster_dir <- function(output_dir, broad_type) {
+  file.path(output_dir, "_subclusters",
+            gsub("_+", "_", gsub("[^A-Za-z0-9]+", "_", broad_type)))
+}
+
+
+######################################
+# SUBSET AND STRIP                   #
+######################################
+
+#clean subset with everything derived from the parent clustering removed.
+#the parent pca.full in particular has to go, because ProjectData() skips
+#computation whenever full.reduction already exists in the object
+prepare_subcluster <- function(obj,
+                               cells,
+                               sample_col     = "sample_id",
+                               keep_images    = FALSE,
+                               min_per_region = 500,
+                               verbose        = TRUE) {
+
+  sub <- subset(obj, cells = cells)
+
+  if (!keep_images) for (nm in Images(sub))     sub[[nm]] <- NULL
+  for (nm in setdiff(Assays(sub), "RNA"))       sub[[nm]] <- NULL
+  for (nm in Reductions(sub))                   sub[[nm]] <- NULL
+  for (nm in Graphs(sub))                       sub[[nm]] <- NULL
+  for (nm in Neighbors(sub))                    sub[[nm]] <- NULL
+  slot(sub, "tools")$TransferSketchLabels <- NULL
+
+  drop <- grep(paste0("^sketch_snn_res\\.|^RNA_snn_res\\.|^seurat_clusters$|",
+                      "^sketch_cluster$|^subcluster$|^sub_type$|",
+                      "_projected$|_projected\\.score$"),
+               colnames(sub@meta.data), value = TRUE)
+  for (nm in drop) sub@meta.data[[nm]] <- NULL
+
+  DefaultAssay(sub) <- "RNA"
+  sub[["RNA"]] <- JoinLayers(sub[["RNA"]])
+
+  #only split by region if every region contributes enough cells to
+  #normalise and pick hvgs on
+  per_region <- table(sub@meta.data[[sample_col]])
+  per_region <- per_region[per_region > 0]
+
+  if (length(per_region) > 1 && min(per_region) >= min_per_region) {
+    sub[["RNA"]] <- split(
+      sub[["RNA"]],
+      f = droplevels(factor(sub@meta.data[[sample_col]])))
+    if (verbose) cat(.ts(), "   split into", length(per_region), "layers\n")
+  } else if (verbose) {
+    cat(.ts(), "   single RNA layer\n")
+  }
+
+  if (verbose) cat(.ts(), "   subset:", ncol(sub), "cells\n")
+  sub
+}
+
+
+######################################
+# CLUSTER A SUBSET                   #
+######################################
+
+#small subsets cluster directly on RNA, large ones go through the same
+#sketch -> cluster -> project route as the parent. either way cluster_col
+#ends up covering every cell in the subset
+subcluster_broad <- function(sub,
+                             dims         = 1:20,
+                             resolutions  = c(0.2, 0.4, 0.6, 0.8, 1.0, 1.2),
+                             resolution   = 0.6,
+                             n_features   = 2000,
+                             sketch_cells = 20000,
+                             direct_max   = 75000,
+                             cluster_col  = "subcluster",
+                             verbose      = TRUE) {
+
+  DefaultAssay(sub) <- "RNA"
+
+  if (ncol(sub) <= direct_max) {
+
+    if (verbose) cat(.ts(), "   clustering", ncol(sub), "cells directly\n")
+
+    sub <- NormalizeData(sub, verbose = FALSE)
+    sub <- find_variable_features_safe(sub, "RNA", n_features)
+
+    layer_sums <- sapply(
+      Layers(sub[["RNA"]], search = "counts"),
+      function(l) Matrix::rowSums(LayerData(sub, assay = "RNA", layer = l)))
+    detected <- rownames(sub)[rowSums(as.matrix(layer_sums)) > 0]
+    features <- intersect(VariableFeatures(sub, assay = "RNA"), detected)
+
+    npcs <- min(50, length(features) - 1, ncol(sub) - 1)
+    dims <- 1:min(max(dims), npcs)
+
+    sub <- ScaleData(sub, features = features, verbose = FALSE)
+    sub <- RunPCA(sub, features = features, npcs = npcs, verbose = FALSE)
+    sub <- FindNeighbors(sub, reduction = "pca", dims = dims, verbose = FALSE)
+    sub <- FindClusters(sub, resolution = resolutions, verbose = FALSE)
+    sub <- RunUMAP(sub, reduction = "pca", dims = dims,
+                   reduction.name = "umap", verbose = FALSE)
+
+    column <- grep(paste0("_snn_res\\.", resolution, "$"),
+                   colnames(sub@meta.data), value = TRUE)[1]
+    sub@meta.data[[cluster_col]] <- as.character(sub@meta.data[[column]])
+
+  } else {
+
+    if (verbose) cat(.ts(), "   sketching", ncol(sub), "cells\n")
+
+    sub <- sketch_proseg_object(sub,
+                                sketch_cells = sketch_cells,
+                                method       = "leverage",
+                                n_features   = n_features,
+                                verbose      = verbose)
+
+    sub <- cluster_sketch(sub,
+                          dims        = dims,
+                          resolutions = resolutions,
+                          resolution  = resolution,
+                          n_features  = n_features,
+                          integrate   = FALSE,
+                          cluster_col = cluster_col,
+                          verbose     = verbose)
+
+    k_weight <- max(5, min(50, floor(ncol(sub[["sketch"]]) / 20)))
+    sub <- project_sketch_labels(sub,
+                                 label_col = cluster_col,
+                                 dims      = dims,
+                                 k_weight  = k_weight,
+                                 verbose   = verbose)
+  }
+
+  DefaultAssay(sub) <- "RNA"
+  Idents(sub) <- cluster_col
+
+  if (verbose)
+    cat(.ts(), "  ", length(unique(sub@meta.data[[cluster_col]])),
+        "subclusters\n")
+  sub
+}
+
+
+######################################
+# MARKERS FOR A SUBSET               #
+######################################
+
+#writes a marker table as csv, xlsx, or both. xlsx gets one sheet per
+#cluster plus an "all" sheet, which is the format worth opening when you
+#are eyeballing markers cluster by cluster
+.write_markers <- function(markers,
+                           dir,
+                           file,
+                           format    = "csv",
+                           extra     = NULL,
+                           split_col = "cluster") {
+
+  format <- match.arg(format, c("csv", "xlsx"), several.ok = TRUE)
+  dir.create(dir, recursive = TRUE, showWarnings = FALSE)
+  paths <- character()
+
+  if ("csv" %in% format) {
+    path <- file.path(dir, paste0(file, ".csv"))
+    data.table::fwrite(markers, path)
+    paths <- c(paths, path)
+    if (!is.null(extra))
+      for (nm in names(extra)) {
+        side <- file.path(dir, paste0(nm, ".csv"))
+        data.table::fwrite(extra[[nm]], side)
+        paths <- c(paths, side)
+      }
+  }
+
+  if ("xlsx" %in% format) {
+
+    if (!requireNamespace("openxlsx", quietly = TRUE))
+      stop("format \"xlsx\" needs the openxlsx package")
+
+    sheets <- list()
+    if (!is.null(extra)) sheets <- extra
+    sheets[["all"]] <- markers
+
+    if (nrow(markers) && split_col %in% colnames(markers)) {
+      keys <- as.character(markers[[split_col]])
+      by   <- split(markers, factor(keys, levels = unique(keys)))
+      names(by) <- paste0("c", names(by))
+      sheets <- c(sheets, by)
+    }
+
+    #excel caps sheet names at 31 characters and bans a few symbols
+    names(sheets) <- make.unique(substr(
+      gsub("[\\[\\]:*?/\\\\]", "_", names(sheets)), 1, 28))
+
+    path <- file.path(dir, paste0(file, ".xlsx"))
+    openxlsx::write.xlsx(sheets, path, overwrite = TRUE)
+    paths <- c(paths, path)
+  }
+
+  invisible(paths)
+}
+
+
+#dir = NULL computes markers without touching disk, which is how you test a
+#candidate resolution before committing to it. format may be "csv", "xlsx",
+#or c("csv", "xlsx")
+subcluster_markers <- function(sub,
+                               cluster_col = "subcluster",
+                               dir         = NULL,
+                               only_pos    = TRUE,
+                               logfc       = 0.25,
+                               min_pct     = 0.2,
+                               format      = "csv",
+                               cache       = FALSE) {
+
+  if (!cluster_col %in% colnames(sub@meta.data))
+    stop(cluster_col, " not found. available groupings: ",
+         paste(subcluster_resolutions(sub)$column, collapse = ", "))
+
+  path <- if (!is.null(dir)) file.path(dir, "markers.csv") else NULL
+
+  if (cache && !is.null(path) && file.exists(path))
+    return(data.table::fread(path, data.table = FALSE))
+
+  assay <- if ("sketch" %in% Assays(sub)) "sketch" else "RNA"
+
+  if (length(Layers(sub[[assay]], search = "data")) > 1)
+    sub[[assay]] <- JoinLayers(sub[[assay]])
+
+  DefaultAssay(sub) <- assay
+  Idents(sub) <- cluster_col
+
+  markers <- FindAllMarkers(sub,
+                            assay           = assay,
+                            group.by        = cluster_col,
+                            only.pos        = only_pos,
+                            logfc.threshold = logfc,
+                            min.pct         = min_pct,
+                            verbose         = FALSE)
+
+  if (!is.null(dir))
+    .write_markers(markers, dir, "markers", format = format)
+
+  markers
+}
+
+
+######################################
+# COMPARE TWO CLUSTERS DIRECTLY      #
+######################################
+
+#subcluster_markers() is one vs rest, so two similar clusters will both
+#return the same genes against the pooled remainder. this tests them
+#against each other only. a near empty result means the two clusters are
+#not separable and should probably be merged
+compare_clusters <- function(sub,
+                             ident_1,
+                             ident_2,
+                             cluster_col = "subcluster",
+                             assay       = NULL,
+                             logfc       = 0.2,
+                             min_pct     = 0.1,
+                             n           = 30,
+                             dir         = NULL,
+                             format      = "csv",
+                             verbose     = TRUE) {
+
+  if (!cluster_col %in% colnames(sub@meta.data))
+    stop(cluster_col, " not found. available groupings: ",
+         paste(subcluster_resolutions(sub)$column, collapse = ", "))
+
+  groups <- as.character(sub@meta.data[[cluster_col]])
+  ident_1 <- as.character(ident_1)
+  ident_2 <- as.character(ident_2)
+
+  for (id in c(ident_1, ident_2))
+    if (!id %in% groups)
+      stop("cluster ", id, " not present in ", cluster_col)
+
+  assay <- assay %||% if ("sketch" %in% Assays(sub)) "sketch" else "RNA"
+  if (length(Layers(sub[[assay]], search = "data")) > 1)
+    sub[[assay]] <- JoinLayers(sub[[assay]])
+  DefaultAssay(sub) <- assay
+
+  res <- FindMarkers(sub,
+                     assay           = assay,
+                     group.by        = cluster_col,
+                     ident.1         = ident_1,
+                     ident.2         = ident_2,
+                     only.pos        = FALSE,
+                     logfc.threshold = logfc,
+                     min.pct         = min_pct,
+                     verbose         = FALSE)
+
+  if (nrow(res)) {
+    res$gene      <- rownames(res)
+    res$higher_in <- ifelse(res$avg_log2FC > 0, ident_1, ident_2)
+    res <- res[order(-abs(res$avg_log2FC)),
+               c("gene", "avg_log2FC", "pct.1", "pct.2",
+                 "p_val_adj", "higher_in")]
+    rownames(res) <- NULL
+  }
+
+  if (!is.null(dir) && nrow(res))
+    .write_markers(res, dir,
+                   paste0("compare_", ident_1, "_vs_", ident_2),
+                   format = format, split_col = "higher_in")
+
+  if (verbose) {
+    cat(.ts(), " ", ident_1, " (n=", sum(groups == ident_1), ") vs ",
+        ident_2, " (n=", sum(groups == ident_2), "): ",
+        nrow(res), " genes at logfc>", logfc, "\n", sep = "")
+    if (nrow(res)) print(head(res, n))
+    else cat(.ts(), " nothing separates them, consider merging\n")
+  }
+  invisible(res)
+}
+
+
+######################################
+# NEAREST NEIGHBOUR MARKERS          #
+######################################
+
+#one vs rest drowns out the differences between clusters that sit next to
+#each other, because the pooled remainder is dominated by distant cell
+#types. this locates each cluster's k closest neighbours by centroid
+#distance in the reduction and tests against those only, so the genes
+#returned are the ones that actually separate look-alikes
+neighbour_markers <- function(sub,
+                              cluster_col = "subcluster",
+                              reduction   = "pca",
+                              dims        = NULL,
+                              k           = 1,
+                              assay       = NULL,
+                              logfc       = 0.2,
+                              min_pct     = 0.1,
+                              only_pos    = TRUE,
+                              dir         = NULL,
+                              format      = "csv",
+                              verbose     = TRUE) {
+
+  if (!cluster_col %in% colnames(sub@meta.data))
+    stop(cluster_col, " not found. available groupings: ",
+         paste(subcluster_resolutions(sub)$column, collapse = ", "))
+  if (!reduction %in% Reductions(sub))
+    stop("no reduction called '", reduction, "'. available: ",
+         paste(Reductions(sub), collapse = ", "))
+
+  assay <- assay %||% if ("sketch" %in% Assays(sub)) "sketch" else "RNA"
+  if (length(Layers(sub[[assay]], search = "data")) > 1)
+    sub[[assay]] <- JoinLayers(sub[[assay]])
+  DefaultAssay(sub) <- assay
+
+  #the sketch reduction only covers sketch cells, which is also all the
+  #de can use, so the intersection is the right cell set either way
+  emb   <- Embeddings(sub[[reduction]])
+  cells <- intersect(rownames(emb), colnames(sub[[assay]]))
+  emb   <- emb[cells, , drop = FALSE]
+
+  if (is.null(dims)) dims <- 1:min(ncol(emb), 20)
+  emb <- emb[, dims, drop = FALSE]
+
+  groups <- as.character(sub@meta.data[cells, cluster_col])
+  ok     <- !is.na(groups)
+  emb    <- emb[ok, , drop = FALSE]
+  groups <- groups[ok]
+
+  centroids <- t(sapply(split(seq_along(groups), groups),
+                        function(i) colMeans(emb[i, , drop = FALSE])))
+  ids <- rownames(centroids)
+  if (length(ids) < 2) stop("need at least two clusters")
+
+  distances <- as.matrix(stats::dist(centroids))
+  diag(distances) <- Inf
+  k <- min(k, length(ids) - 1)
+
+  tables <- list()
+  map    <- list()
+
+  for (id in ids) {
+
+    nb  <- names(sort(distances[id, ]))[1:k]
+    tag <- paste(nb, collapse = "+")
+
+    res <- tryCatch(
+      FindMarkers(sub,
+                  assay           = assay,
+                  group.by        = cluster_col,
+                  ident.1         = id,
+                  ident.2         = nb,
+                  only.pos        = only_pos,
+                  logfc.threshold = logfc,
+                  min.pct         = min_pct,
+                  verbose         = FALSE),
+      error = function(e) NULL)
+
+    n_genes <- if (is.null(res)) NA_integer_ else nrow(res)
+
+    if (!is.null(res) && nrow(res)) {
+      res$gene    <- rownames(res)
+      res$cluster <- id
+      res$versus  <- tag
+      res <- res[order(-res$avg_log2FC), ]
+      rownames(res) <- NULL
+      tables[[id]] <- res
+    }
+
+    map[[id]] <- data.frame(
+      cluster  = id,
+      n_cells  = sum(groups == id),
+      nearest  = tag,
+      distance = round(min(distances[id, ]), 2),
+      n_genes  = n_genes,
+      stringsAsFactors = FALSE)
+  }
+
+  pairs <- do.call(rbind, map)
+  rownames(pairs) <- NULL
+
+  markers <- if (length(tables)) do.call(rbind, tables) else data.frame()
+  if (nrow(markers))
+    markers <- markers[, c("gene", "cluster", "versus", "avg_log2FC",
+                           "pct.1", "pct.2", "p_val", "p_val_adj")]
+  rownames(markers) <- NULL
+  attr(markers, "pairs") <- pairs
+
+  if (!is.null(dir))
+    .write_markers(markers, dir, "markers_neighbour",
+                   format = format,
+                   extra  = list(neighbour_pairs = pairs))
+
+  if (verbose) {
+    cat(.ts(), " each cluster vs its", k, "nearest in", reduction, "\n")
+    print(pairs)
+    weak <- pairs$cluster[!is.na(pairs$n_genes) & pairs$n_genes == 0]
+    if (length(weak))
+      cat(.ts(), " nothing separates", paste(weak, collapse = ", "),
+          "from their neighbour\n")
+  }
+  markers
+}
+
+
+######################################
+# PASS 1: RECLUSTER EVERY COMPARTMENT#
+######################################
+
+#loops the broad labels, reclusters each one, writes markers, an empty
+#annotation template and the subcluster object to
+#<output_dir>/_subclusters/<compartment>/
+run_subclustering <- function(obj,
+                              broad_col    = "broad_type",
+                              output_dir   = "./annotated_data",
+                              skip_types   = NULL,
+                              min_cells    = 500,
+                              dims         = 1:20,
+                              resolutions  = c(0.2, 0.4, 0.6, 0.8, 1.0, 1.2),
+                              resolution   = 0.6,
+                              n_features   = 2000,
+                              sketch_cells = 20000,
+                              direct_max   = 75000,
+                              cluster_col  = "subcluster",
+                              n_genes      = 15,
+                              markers      = FALSE,
+                              overwrite    = FALSE,
+                              verbose      = TRUE) {
+
+  if (!broad_col %in% colnames(obj@meta.data))
+    stop(broad_col, " not found, run label_sketch_clusters() first")
+
+  types <- setdiff(
+    sort(unique(na.omit(as.character(obj@meta.data[[broad_col]])))),
+    skip_types)
+
+  rows <- list()
+
+  for (type in types) {
+
+    cells <- colnames(obj)[which(obj@meta.data[[broad_col]] == type)]
+    dir   <- subcluster_dir(output_dir, type)
+    path  <- file.path(dir, "subcluster.rds")
+
+    if (!overwrite && file.exists(path)) {
+      if (verbose) cat(.ts(), " ", type, ": cached\n", sep = "")
+      sub <- readRDS(path)
+      rows[[type]] <- data.frame(
+        broad_type    = type,
+        n_cells       = ncol(sub),
+        n_subclusters = length(unique(sub@meta.data[[cluster_col]])),
+        status        = "cached",
+        dir           = dir,
+        stringsAsFactors = FALSE)
+      rm(sub); gc(verbose = FALSE)
+      next
+    }
+
+    if (length(cells) < min_cells) {
+      if (verbose) cat(.ts(), " ", type, ": only ", length(cells),
+                       " cells, skipped\n", sep = "")
+      rows[[type]] <- data.frame(
+        broad_type = type, n_cells = length(cells), n_subclusters = NA_integer_,
+        status = "too small", dir = NA_character_, stringsAsFactors = FALSE)
+      next
+    }
+
+    if (verbose) cat("\n", .ts(), " ==== ", type, " ====\n", sep = "")
+    dir.create(dir, recursive = TRUE, showWarnings = FALSE)
+
+    sub <- prepare_subcluster(obj, cells = cells, verbose = verbose)
+    sub <- subcluster_broad(sub,
+                            dims         = dims,
+                            resolutions  = resolutions,
+                            resolution   = resolution,
+                            n_features   = n_features,
+                            sketch_cells = sketch_cells,
+                            direct_max   = direct_max,
+                            cluster_col  = cluster_col,
+                            verbose      = verbose)
+
+    #markers are deferred by default, they depend on the resolution you
+    #settle on after looking at the umap. see finalise_subcluster()
+    if (isTRUE(markers)) {
+      marker_table <- subcluster_markers(sub, cluster_col = cluster_col,
+                                         dir = dir)
+      write_cluster_template(sub, marker_table, cluster_col = cluster_col,
+                             n_genes = n_genes,
+                             path = file.path(dir, "annotation.csv"))
+      rm(marker_table)
+    }
+
+    saveRDS(sub, path)
+
+    rows[[type]] <- data.frame(
+      broad_type    = type,
+      n_cells       = ncol(sub),
+      n_subclusters = length(unique(sub@meta.data[[cluster_col]])),
+      status        = "done",
+      dir           = dir,
+      stringsAsFactors = FALSE)
+
+    rm(sub); gc(verbose = FALSE)
+  }
+
+  summary_table <- do.call(rbind, rows)
+  rownames(summary_table) <- NULL
+  if (verbose) print(summary_table)
+  invisible(summary_table)
+}
+
+
+######################################
+# INSPECT ONE COMPARTMENT            #
+######################################
+
+#every resolution stored on an object, with the cluster count for each
+subcluster_resolutions <- function(object) {
+
+  cols <- grep("_snn_res\\.", colnames(object@meta.data), value = TRUE)
+  if (!length(cols)) return(data.frame())
+
+  out <- data.frame(
+    column     = cols,
+    resolution = as.numeric(gsub("^.*_snn_res\\.", "", cols)),
+    n_clusters = as.integer(sapply(cols, function(x)
+      length(unique(na.omit(object@meta.data[[x]]))))),
+    stringsAsFactors = FALSE)
+
+  out <- out[order(out$resolution), ]
+  rownames(out) <- NULL
+  out
+}
+
+
+#pull a subcluster back into the session for labelling in RStudio.
+#returns list(obj = , markers = , top = , dir = , broad_type = ,
+#             resolutions = )
+load_subcluster <- function(broad_type,
+                            output_dir  = "./annotated_data",
+                            cluster_col = "subcluster",
+                            n_genes     = 15,
+                            plot        = FALSE) {
+
+  dir  <- subcluster_dir(output_dir, broad_type)
+  path <- file.path(dir, "subcluster.rds")
+  if (!file.exists(path)) stop("no subcluster object at ", path)
+
+  sub <- readRDS(path)
+  res <- subcluster_resolutions(sub)
+
+  marker_path <- file.path(dir, "markers.csv")
+  markers <- if (file.exists(marker_path))
+    data.table::fread(marker_path, data.table = FALSE) else NULL
+  top <- if (!is.null(markers)) top_cluster_markers(markers, n_genes) else NULL
+
+  cat(.ts(), " ", broad_type, ": ", ncol(sub), " cells\n", sep = "")
+  print(res)
+
+  if (is.null(markers))
+    cat(.ts(), " no markers yet. pick a resolution from the umap, then",
+        "finalise_subcluster()\n")
+
+  if (plot && nrow(res)) print(DimPlot(sub, group.by = res$column, label = TRUE))
+
+  invisible(list(obj         = sub,
+                 markers     = markers,
+                 top         = top,
+                 dir         = dir,
+                 broad_type  = broad_type,
+                 resolutions = res))
+}
+
+
+######################################
+# SET THE FINAL RESOLUTION           #
+######################################
+
+#points cluster_col at one of the stored resolutions. on a sketched subset
+#the labels are re-projected to every cell, which is cheap because pca.full
+#and the transfer neighbours are already cached on the object
+set_subcluster_resolution <- function(object,
+                                      resolution,
+                                      cluster_col = "subcluster",
+                                      dims        = 1:20,
+                                      project     = TRUE,
+                                      verbose     = TRUE) {
+
+  sketched <- "sketch" %in% Assays(object)
+  column   <- paste0(if (sketched) "sketch" else "RNA", "_snn_res.", resolution)
+
+  if (!column %in% colnames(object@meta.data)) {
+    hits <- grep(paste0("_snn_res\\.", resolution, "$"),
+                 colnames(object@meta.data), value = TRUE)
+    if (!length(hits))
+      stop("no clustering at resolution ", resolution, ". available: ",
+           paste(subcluster_resolutions(object)$resolution, collapse = ", "))
+    column <- hits[1]
+  }
+
+  object@meta.data[[cluster_col]] <- as.character(object@meta.data[[column]])
+
+  if (sketched && project) {
+    k_weight <- max(5, min(50, floor(ncol(object[["sketch"]]) / 20)))
+    object <- project_sketch_labels(object,
+                                    label_col = cluster_col,
+                                    dims      = dims,
+                                    k_weight  = k_weight,
+                                    verbose   = verbose)
+  }
+
+  DefaultAssay(object) <- "RNA"
+  Idents(object) <- cluster_col
+
+  if (verbose)
+    cat(.ts(), " ", column, " -> ", cluster_col, ": ",
+        length(unique(na.omit(object@meta.data[[cluster_col]]))),
+        " clusters\n", sep = "")
+  object
+}
+
+
+######################################
+# LOCK IN A RESOLUTION AND GET MARKERS#
+######################################
+
+#set the resolution, compute markers for it, write the annotation template
+#and save the object back. x is the list from load_subcluster(), or a Seurat
+#object plus broad_type
+finalise_subcluster <- function(x,
+                                resolution,
+                                broad_type  = NULL,
+                                output_dir  = "./annotated_data",
+                                cluster_col = "subcluster",
+                                dims        = 1:20,
+                                n_genes     = 15,
+                                only_pos    = TRUE,
+                                logfc       = 0.25,
+                                min_pct     = 0.2,
+                                format      = "csv",
+                                save        = TRUE,
+                                verbose     = TRUE) {
+
+  if (inherits(x, "Seurat")) {
+    if (is.null(broad_type))
+      stop("supply broad_type when passing a Seurat object")
+    x <- list(obj = x, dir = subcluster_dir(output_dir, broad_type),
+              broad_type = broad_type)
+  }
+
+  sub <- set_subcluster_resolution(x$obj, resolution,
+                                   cluster_col = cluster_col,
+                                   dims        = dims,
+                                   verbose     = verbose)
+
+  if (verbose) cat(.ts(), " markers at resolution", resolution, "\n")
+
+  markers <- subcluster_markers(sub,
+                                cluster_col = cluster_col,
+                                dir         = x$dir,
+                                only_pos    = only_pos,
+                                logfc       = logfc,
+                                min_pct     = min_pct,
+                                format      = format,
+                                cache       = FALSE)
+
+  write_cluster_template(sub, markers,
+                         cluster_col = cluster_col,
+                         n_genes     = n_genes,
+                         path        = file.path(x$dir, "annotation.csv"))
+
+  if (save) saveRDS(sub, file.path(x$dir, "subcluster.rds"))
+
+  if (verbose)
+    print(sort(table(sub@meta.data[[cluster_col]]), decreasing = TRUE))
+
+  invisible(list(obj         = sub,
+                 markers     = markers,
+                 top         = top_cluster_markers(markers, n_genes),
+                 dir         = x$dir,
+                 broad_type  = x$broad_type,
+                 resolutions = subcluster_resolutions(sub)))
+}
+
+
+######################################
+# WRITE LABELS BACK TO THE PARENT    #
+######################################
+
+write_back_labels <- function(obj,
+                              sub,
+                              from   = "sub_type",
+                              to     = "cell_type",
+                              prefix = NULL,
+                              cells  = NULL) {
+
+  if (!to %in% colnames(obj@meta.data)) obj@meta.data[[to]] <- NA_character_
+
+  cells  <- cells %||% colnames(sub)
+  cells  <- intersect(cells, colnames(sub))
+  if (!length(cells)) return(obj)
+
+  labels <- as.character(sub@meta.data[cells, from])
+  if (!is.null(prefix)) labels <- paste(prefix, labels, sep = " - ")
+
+  obj@meta.data[cells, to] <- labels
+  obj
+}
+
+
+######################################
+# STAGE MISPLACED CELLS FOR RESCUE   #
+######################################
+
+#subclustering always throws off clusters that belong somewhere else:
+#fibroblasts sitting inside Immune, macrophages inside Endothelial, and so
+#on. label those Rem.<something> in sub_labels, then call this to move them
+#into their own compartment so they can be reclustered together, free of
+#the dominant cell type that was drowning them out.
+#
+#labels are matched on the fine part only, so "Immune - Rem.Fibro" and
+#"Rem.Fibro" both count.
+#
+#include_unlabelled also picks up cells that never received a fine label:
+#either NA, or still carrying the bare compartment name because their
+#broad_type changed after their compartment's subcluster.rds was cached.
+stage_rescue_compartment <- function(obj,
+                                     label_col          = "cell_type",
+                                     broad_col          = "broad_type",
+                                     prefix             = "Rem.",
+                                     rescue_as          = "Rescue",
+                                     include_unlabelled = TRUE,
+                                     verbose            = TRUE) {
+
+  if (!label_col %in% colnames(obj@meta.data))
+    stop(label_col, " not found, run apply_subcluster_labels() first")
+
+  full  <- as.character(obj@meta.data[[label_col]])
+  broad <- as.character(obj@meta.data[[broad_col]])
+  fine  <- sub("^.*? - ", "", full, perl = TRUE)
+
+  is_rem <- !is.na(fine) & startsWith(fine, prefix)
+
+  is_bare <- rep(FALSE, length(full))
+  if (include_unlabelled) {
+    already <- !is.na(broad) & broad == rescue_as
+    is_bare <- (is.na(full) |
+                (!is.na(full) & !is.na(broad) & full == broad)) & !already
+  }
+
+  take <- is_rem | is_bare
+
+  if (!any(take)) {
+    if (verbose) cat(.ts(), " nothing to stage\n")
+    return(obj)
+  }
+
+  if (verbose) {
+    cat(.ts(), " staging ", sum(take), " cells as '", rescue_as, "': ",
+        sum(is_rem), " matching '", prefix, "', ",
+        sum(is_bare), " unlabelled\n", sep = "")
+    source <- ifelse(is.na(broad[take]), "<NA>", broad[take])
+    print(sort(table(paste0(source, " / ",
+                            ifelse(is_rem[take], fine[take], "<unlabelled>"))),
+               decreasing = TRUE))
+  }
+
+  obj@meta.data[[broad_col]][take] <- rescue_as
+
+  #cell_type is rebuilt from broad_type by apply_subcluster_labels(), so
+  #clear the stale labels now
+  obj@meta.data[[label_col]][take] <- rescue_as
+
+  if (verbose) print(sort(table(obj@meta.data[[broad_col]]), decreasing = TRUE))
+  obj
+}
+
+
+######################################
+# PASS 2: APPLY THE FINE LABELS      #
+######################################
+
+#labels may be
+#  NULL                     read every compartment from its annotation.csv
+#  a named list of named
+#  character vectors        e.g. list("Fibroblast" = c("0" = "Papillary"))
+#compartments missing from the list fall back to their csv
+apply_subcluster_labels <- function(obj,
+                                    labels        = NULL,
+                                    broad_col     = "broad_type",
+                                    label_col     = "cell_type",
+                                    cluster_col   = "subcluster",
+                                    sub_label_col = "sub_type",
+                                    output_dir    = "./annotated_data",
+                                    prefix        = TRUE,
+                                    skip_types    = NULL,
+                                    save          = TRUE,
+                                    verbose       = TRUE) {
+
+  #compartments with no subclustering keep their broad label
+  obj@meta.data[[label_col]] <- as.character(obj@meta.data[[broad_col]])
+
+  types <- setdiff(
+    sort(unique(na.omit(as.character(obj@meta.data[[broad_col]])))),
+    skip_types)
+
+  for (type in types) {
+
+    dir  <- subcluster_dir(output_dir, type)
+    path <- file.path(dir, "subcluster.rds")
+    if (!file.exists(path)) next
+
+    sub  <- readRDS(path)
+    here <- if (!is.null(labels)) labels[[type]] else NULL
+
+    sub <- tryCatch(
+      label_sketch_clusters(sub,
+                            labels      = here,
+                            cluster_col = cluster_col,
+                            label_col   = sub_label_col,
+                            output_dir  = output_dir,
+                            template    = file.path(dir, "annotation.csv"),
+                            verbose     = FALSE),
+      error = function(e)
+        stop("[", type, "] ", conditionMessage(e), call. = FALSE))
+
+    #a cell that has since been moved to another compartment, e.g. by
+    #stage_rescue_compartment(), must not be relabelled by its old one
+    still_here <- colnames(sub)[
+      which(as.character(obj@meta.data[colnames(sub), broad_col]) == type)]
+
+    use_prefix <- if (isTRUE(prefix)) TRUE
+                  else if (isFALSE(prefix)) FALSE
+                  else type %in% prefix
+
+    obj <- write_back_labels(obj, sub,
+                             from   = sub_label_col,
+                             to     = label_col,
+                             prefix = if (use_prefix) type else NULL,
+                             cells  = still_here)
+
+    if (verbose)
+      cat(.ts(), " ", type, ": ",
+          length(unique(sub@meta.data[[sub_label_col]])), " labels applied to ",
+          length(still_here), " of ", ncol(sub), " cells\n", sep = "")
+
+    if (save) saveRDS(sub, path)
+    rm(sub); gc(verbose = FALSE)
+  }
+
+  Idents(obj) <- label_col
+  if (verbose) print(sort(table(obj@meta.data[[label_col]]), decreasing = TRUE))
+  obj
+}
+
+
+#######################################################################
+#######################################################################
+#                                                                     #
+#                              COLOUR MAP                             #
+#                                                                     #
+#######################################################################
+#######################################################################
+
+#CONTENTS: cohort wide colour assignment and persistence
+
+######################################
+# COLOUR MAP                         #
+######################################
+
+#one colour per label for the whole cohort, persisted to disk
+build_colour_map <- function(obj,
+                             label_col        = "cell_type",
+                             output_dir       = "./annotated_data",
+                             spatial_contrast = TRUE,
+                             seed             = 1,
+                             overwrite        = TRUE) {
+
+  path   <- file.path(output_dir, "cell_type_colours.csv")
+  labels <- sort(unique(na.omit(as.character(obj@meta.data[[label_col]]))))
+
+  if (file.exists(path) && !overwrite) {
+    colours <- load_colour_map(output_dir)
+    for (label in setdiff(labels, names(colours))) {
+      index <- length(colours) + 1
+      colours[label] <- if (index <= length(default_palette))
+        default_palette[index] else hcl.colors(index, "Dark 3")[index]
+    }
+  } else if (spatial_contrast &&
+             exists("assign_contrast_palette", mode = "function")) {
+    adjacency <- NULL
+    if (exists("cluster_spatial_adjacency", mode = "function") &&
+        length(Images(obj))) {
+      adjacency <- tryCatch(
+        Reduce(merge_adjacency,
+               lapply(Images(obj), function(fov)
+                 cluster_spatial_adjacency(obj, group_col = label_col,
+                                           image = fov, k = 12))),
+        error = function(e) NULL)
+    }
+    colours <- assign_contrast_palette(labels, adjacency = adjacency,
+                                       seed = seed, verbose = FALSE)
+  } else {
+    ranked  <- names(sort(table(as.character(obj@meta.data[[label_col]])),
+                          decreasing = TRUE))
+    colours <- setNames(vapply(seq_along(ranked), function(index)
+      if (index <= length(default_palette)) default_palette[index] else
+        hcl.colors(index, "Dark 3")[index], character(1)), ranked)
+    colours <- colours[labels]
+  }
+
+  dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+  data.table::fwrite(
+    data.frame(cell_type = names(colours), hex = unname(colours)), path)
+  cat(.ts(), " colours:", path, "\n")
+  colours
+}
+
+#load the persisted colour map
+load_colour_map <- function(output_dir = "./annotated_data") {
+  path <- file.path(output_dir, "cell_type_colours.csv")
+  if (!file.exists(path)) stop("no colour map at ", path)
+  table <- data.table::fread(path, data.table = FALSE)
+  setNames(table$hex, table$cell_type)
+}
+
+#combine two adjacency matrices over the union of their labels
+merge_adjacency <- function(a, b) {
+  labels <- union(rownames(a), rownames(b))
+  merged <- matrix(0, length(labels), length(labels),
+                   dimnames = list(labels, labels))
+  merged[rownames(a), colnames(a)] <- merged[rownames(a), colnames(a)] + a
+  merged[rownames(b), colnames(b)] <- merged[rownames(b), colnames(b)] + b
+  merged
+}
+
+#######################################################################
+#######################################################################
+#                                                                     #
+#                       SPATIAL PLOTS AND EXPORT                      #
+#                                                                     #
+#######################################################################
+#######################################################################
+
+#CONTENTS: region and cohort spatial plots, per region rds/h5ad/csv export
+
+######################################
+# SPATIAL PLOTS                      #
+######################################
+
+#cell types on the proseg segmentation of one region
+plot_proseg_spatial <- function(obj,
+                                group_col  = "cell_type",
+                                fov        = NULL,
+                                colours    = NULL,
+                                output_dir = "./annotated_data",
+                                size       = 0.6,
+                                border     = NA,
+                                dark       = FALSE,
+                                legend     = TRUE,
+                                title      = NULL) {
+
+  colours <- colours %||% load_colour_map(output_dir)
+  fov     <- fov %||% Images(obj)[1]
+  labels  <- setdiff(unique(as.character(obj@meta.data[[group_col]])), NA)
+  missing <- setdiff(labels, names(colours))
+  if (length(missing)) stop("no colour for: ", paste(missing, collapse = ", "))
+
+  ImageDimPlot(obj, fov = fov, group.by = group_col, cols = colours[labels],
+               size = size, border.color = border, border.size = 0,
+               dark.background = dark) +
+    ggtitle(title %||% fov) +
+    theme(plot.title = element_text(size = 14, face = "bold"),
+          legend.position = if (legend) "right" else "none",
+          legend.text = element_text(size = 8))
+}
+
+#all regions side by side from centroid coordinates
+plot_cohort_spatial <- function(obj,
+                                group_col  = "cell_type",
+                                sample_col = "sample_id",
+                                colours    = NULL,
+                                size       = 0.3,
+                                ncol       = 3) {
+
+  coords <- do.call(rbind, lapply(Images(obj), function(fov) {
+    region <- proseg_coords(obj, fov)
+    region$fov <- fov
+    region
+  }))
+
+  meta  <- obj@meta.data[rownames(coords), c(group_col, sample_col),
+                         drop = FALSE]
+  frame <- cbind(coords, meta)
+  frame <- frame[!is.na(frame[[group_col]]), ]
+
+  ggplot(frame, aes(x, y, colour = .data[[group_col]])) +
+    geom_point(size = size, stroke = 0) +
+    (if (!is.null(colours)) scale_colour_manual(values = colours) else NULL) +
+    coord_fixed() +
+    facet_wrap(as.formula(paste("~", sample_col)), ncol = ncol,
+               scales = "free") +
+    guides(colour = guide_legend(override.aes = list(size = 3))) +
+    theme_void(base_size = 10)
+}
+
+######################################
+# EXPORT ANNOTATED REGIONS           #
+######################################
+
+#write rds, h5ad, metadata and plots for each region
+#image names are not guaranteed to equal sample_id: Seurat sanitises them
+#on assignment, so "XE791-D" can land as "XE791.D". resolve the match
+#rather than assuming it
+.match_fov <- function(region, sample_id) {
+
+  images <- Images(region)
+  if (!length(images)) return(NULL)
+  if (sample_id %in% images) return(sample_id)
+
+  flatten <- function(x) tolower(gsub("[^A-Za-z0-9]+", "", x))
+  hit <- images[flatten(images) == flatten(sample_id)]
+  if (length(hit)) return(hit[1])
+
+  #last resort: the only image still holding cells after subsetting
+  n <- vapply(images, function(i)
+    length(intersect(Cells(region[[i]]), colnames(region))), integer(1))
+  if (sum(n > 0) == 1) return(images[which(n > 0)])
+  NULL
+}
+
+export_annotated_regions <- function(obj,
+                                     output_dir = "./annotated_data",
+                                     label_col  = "cell_type",
+                                     sample_col = "sample_id",
+                                     colours    = NULL,
+                                     write_rds  = TRUE,
+                                     write_h5ad = TRUE,
+                                     plots      = TRUE,
+                                     size       = 0.6,
+                                     verbose    = TRUE) {
+
+  colours <- colours %||% build_colour_map(obj, label_col, output_dir)
+  DefaultAssay(obj) <- "RNA"
+  samples <- unique(obj@meta.data[[sample_col]])
+  summary_rows <- list()
+
+  for (sample_id in samples) {
+
+    if (verbose) cat(.ts(), " exporting", sample_id, "\n")
+    region_dir <- file.path(output_dir, sample_id)
+    dir.create(region_dir, recursive = TRUE, showWarnings = FALSE)
+
+    cells  <- colnames(obj)[obj@meta.data[[sample_col]] == sample_id]
+    region <- subset(obj, cells = cells)
+
+    fov_name <- .match_fov(region, sample_id)
+    for (img in setdiff(Images(region), fov_name)) region[[img]] <- NULL
+
+    region[["RNA"]] <- JoinLayers(region[["RNA"]])
+
+    if (write_rds)
+      saveRDS(region, file.path(region_dir,
+                                paste0(sample_id, "_annotated.rds")))
+
+    data.table::fwrite(region@meta.data,
+                       file.path(region_dir, "cell_annotations.csv.gz"))
+
+    if (write_h5ad)
+      export_h5ad(region, file.path(region_dir,
+                                    paste0(sample_id, "_annotated.h5ad")))
+
+    if (plots) {
+      if (is.null(fov_name)) {
+        cat(.ts(), "  no image matching", sample_id,
+            "- available:", paste(Images(obj), collapse = ", "), "\n")
+      } else {
+        pdf(file.path(region_dir, "spatial_cell_types.pdf"),
+            width = 14, height = 12)
+        print(plot_proseg_spatial(region, label_col, fov = fov_name,
+                                  colours = colours, size = size,
+                                  title = sample_id))
+        dev.off()
+      }
+    }
+
+    summary_rows[[sample_id]] <- data.frame(
+      sample_id = sample_id,
+      n_cells   = ncol(region),
+      labelled  = sum(!is.na(region@meta.data[[label_col]])),
+      n_types   = length(setdiff(unique(region@meta.data[[label_col]]), NA)),
+      stringsAsFactors = FALSE)
+
+    rm(region); gc(verbose = FALSE)
+  }
+
+  summary_table <- do.call(rbind, summary_rows)
+  data.table::fwrite(summary_table,
+                     file.path(output_dir, "annotation_summary.csv"))
+  if (verbose) print(summary_table)
+  invisible(summary_table)
+}
+
+#write a Seurat object to h5ad with spatial coordinates
+export_h5ad <- function(obj, path, assay = "RNA", layer = "counts") {
+
+  if (!requireNamespace("reticulate", quietly = TRUE)) {
+    cat(.ts(), " reticulate unavailable, skipping h5ad\n")
+    return(invisible(FALSE))
+  }
+
+  written <- tryCatch({
+    anndata <- reticulate::import("anndata", convert = FALSE)
+    sparse  <- reticulate::import("scipy.sparse", convert = FALSE)
+
+    counts <- as(LayerData(obj, assay = assay, layer = layer), "dgCMatrix")
+    matrix <- sparse$csr_matrix(reticulate::r_to_py(Matrix::t(counts)))
+
+    meta <- obj@meta.data
+    meta[] <- lapply(meta, function(column)
+      if (is.factor(column)) as.character(column) else column)
+
+    adata <- anndata$AnnData(
+      X   = matrix,
+      obs = reticulate::r_to_py(meta),
+      var = reticulate::r_to_py(data.frame(row.names = rownames(counts))))
+
+    coords <- proseg_coords(obj, cells = colnames(counts))
+    if (!is.null(coords) && nrow(coords) == ncol(counts))
+      adata$obsm$update(reticulate::dict(
+        spatial = reticulate::r_to_py(as.matrix(coords[colnames(counts), ]))))
+
+    adata$write_h5ad(path)
+    TRUE
+  }, error = function(e) {
+    cat(.ts(), " h5ad failed:", conditionMessage(e), "\n")
+    FALSE
+  })
+
+  if (isTRUE(written)) cat(.ts(), " h5ad:", path, "\n")
+  invisible(written)
+}
+
+#######################################################################
+#######################################################################
+#                                                                     #
+#                      REFERENCE BASED ANNOTATION                     #
+#                                                                     #
+#######################################################################
+#######################################################################
+
+#CONTENTS: label transfer from an external reference, RCTD and SingleR workflows
+
+######################################
+# SEURAT LABEL TRANSFER              #
+######################################
 
 annotate_proseg_seurat_10x <- function(
     proseg_dir = "./proseg_results",
@@ -562,7 +2524,7 @@ annotate_proseg_seurat_10x <- function(
   ##########################################################################
   rds_hits <- list.files(
     proseg_dir,
-    pattern = "_proseg_seurat\\.rds$",
+    pattern = "_proseg_seurat_mask\\.rds$",
     recursive = TRUE,
     full.names = TRUE
   )
@@ -1167,254 +3129,9 @@ annotate_proseg_seurat_10x <- function(
   cat(ts(), "\n Annotation complete")
 }
 
-###############################################################################
-# ensure_clean_assay
-#
-# Guarantees that the Seurat v5 object has a usable RNA assay with a proper
-# "counts" layer. Handles common edge cases:
-#   - v3/v4 objects loaded into Seurat v5 (may have "data" but no "counts")
-#   - Merged objects with split layers that need joining
-#   - Default assay not set to RNA
-#
-# Args:
-#   obj  Seurat object
-#   nm   Character label for log messages
-#
-# Returns:
-#   The (possibly modified) Seurat object
-###############################################################################
-
-ensure_clean_assay <- function(obj, nm) {
-  
-  # Force default assay to RNA
-  if (DefaultAssay(obj) != "RNA") {
-    log_msg(nm, " | Switching default assay from '",
-            DefaultAssay(obj), "' to 'RNA'")
-    DefaultAssay(obj) <- "RNA"
-  }
-  
-  available <- Layers(obj[["RNA"]])
-  
-  # If counts layer is missing, try to recover
-  if (!"counts" %in% available) {
-    
-    # Some v3/v4 -> v5 conversions store raw counts under "data"
-    if ("data" %in% available) {
-      log_msg(nm, " | No 'counts' layer found; copying 'data' -> 'counts'")
-      obj[["RNA"]]$counts <- LayerData(obj[["RNA"]], layer = "data")
-    } else {
-      # Check for split layers (counts.X, counts.Y, ...)
-      split_counts <- grep("^counts\\.", available, value = TRUE)
-      if (length(split_counts) > 0) {
-        log_msg(nm, " | Found split count layers (",
-                paste(split_counts, collapse = ", "),
-                "); joining...")
-        obj[["RNA"]] <- JoinLayers(obj[["RNA"]])
-      } else {
-        stop("[", nm, "] RNA assay has no 'counts' layer and no recoverable ",
-             "alternative. Available layers: ",
-             paste(available, collapse = ", "))
-      }
-    }
-  }
-  
-  log_msg(nm, " | RNA layers: ",
-          paste(Layers(obj[["RNA"]]), collapse = ", "))
-  
-  return(obj)
-}
-
-
-###############################################################################
-# qc_filter
-#
-# Standard QC filtering on nFeature_RNA and percent mitochondrial content.
-# Uses config$min_genes, config$max_genes, config$max_mt_pct.
-#
-# Args:
-#   obj     Seurat object
-#   config  List with min_genes, max_genes, max_mt_pct
-#   nm      Character label for log messages
-#
-# Returns:
-#   Filtered Seurat object
-###############################################################################
-
-qc_filter <- function(obj, config, nm) {
-  
-  n_before <- ncol(obj)
-  
-  # Compute percent.mt if not already present
-  if (!"percent.mt" %in% colnames(obj@meta.data)) {
-    obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = "^MT-|^mt-")
-  }
-  
-  # Apply filters
-  keep <- obj$nFeature_RNA >= config$min_genes &
-    obj$nFeature_RNA <= config$max_genes &
-    obj$percent.mt   <= config$max_mt_pct
-  
-  n_remove <- sum(!keep)
-  
-  if (n_remove > 0) {
-    obj <- subset(obj, cells = colnames(obj)[keep])
-  }
-  
-  log_msg(nm, " | QC: ", n_before, " -> ", ncol(obj), " cells ",
-          "(removed ", n_remove, "; genes [", config$min_genes, "-",
-          config$max_genes, "], MT <= ", config$max_mt_pct, "%)")
-  
-  return(obj)
-}
-
-
-###############################################################################
-# remove_doublets
-#
-# Detect and remove doublets using scDblFinder. Runs per-batch (sample)
-# to avoid cross-batch artefacts, then removes predicted doublets.
-#
-# Requires: scDblFinder, SingleCellExperiment (loaded in reference_build.R)
-#
-# Args:
-#   obj        Seurat object
-#   batch_col  Metadata column defining batches (e.g. "batch")
-#   nm         Character label for log messages
-#
-# Returns:
-#   Seurat object with doublets removed and scDblFinder.class in metadata
-###############################################################################
-
-remove_doublets <- function(obj, batch_col, nm) {
-  
-  n_before <- ncol(obj)
-  
-  # Convert to SCE for scDblFinder
-  sce <- as.SingleCellExperiment(obj)
-  
-  # Run scDblFinder; if batch_col has only 1 level, don't pass samples
-  batches <- obj@meta.data[[batch_col]]
-  n_batches <- length(unique(batches))
-  
-  if (n_batches > 1) {
-    sce <- scDblFinder(sce, samples = batch_col)
-  } else {
-    sce <- scDblFinder(sce)
-  }
-  
-  # Transfer calls back to Seurat
-  obj$scDblFinder.class <- sce$scDblFinder.class
-  obj$scDblFinder.score <- sce$scDblFinder.score
-  
-  n_doublets <- sum(obj$scDblFinder.class == "doublet")
-  
-  # Remove doublets
-  obj <- subset(obj, scDblFinder.class == "singlet")
-  
-  log_msg(nm, " | Doublets: ", n_doublets, " / ", n_before,
-          " (", round(100 * n_doublets / n_before, 1), "%) removed -> ",
-          ncol(obj), " cells")
-  
-  return(obj)
-}
-
-
-###############################################################################
-# load_h5_to_seurat
-#
-# Load a CellRanger / SpaceRanger filtered_feature_bc_matrix.h5 into a
-# Seurat v5 object.
-#
-# Args:
-#   h5_path      Full path to the .h5 file
-#   sample_name  Character string used as sample identifier
-#
-# Returns:
-#   Seurat object with sample_name in metadata
-###############################################################################
-
-load_h5_to_seurat <- function(h5_path, sample_name) {
-  
-  counts <- Read10X_h5(h5_path)
-  
-  # Read10X_h5 returns a list when multiple modalities exist (e.g. GEX + ADT)
-  # Take Gene Expression if so
-  if (is.list(counts)) {
-    if ("Gene Expression" %in% names(counts)) {
-      counts <- counts[["Gene Expression"]]
-    } else {
-      counts <- counts[[1]]
-    }
-  }
-  
-  obj <- CreateSeuratObject(
-    counts       = counts,
-    project      = sample_name,
-    min.cells    = 0,
-    min.features = 0
-  )
-  
-  obj$sample_name <- sample_name
-  
-  return(obj)
-}
-
-
-###############################################################################
-# sample_name_from_h5
-#
-# Extract a clean sample name from an h5 filename.
-# Strips the standard CellRanger suffix.
-#
-# Examples:
-#   "Sample1_filtered_feature_bc_matrix.h5"  -> "Sample1"
-#   "filtered_feature_bc_matrix.h5"          -> "filtered_feature_bc_matrix"
-#
-# Args:
-#   filename  Character, basename of the h5 file
-#
-# Returns:
-#   Character, cleaned sample name
-###############################################################################
-
-sample_name_from_h5 <- function(filename) {
-  
-  name <- sub("\\.h5$", "", filename)
-  
-  stripped <- sub("_?filtered_feature_bc_matrix$", "", name)
-  stripped <- sub("_?raw_feature_bc_matrix$", "", stripped)
-  
-  if (nchar(stripped) == 0) {
-    return(name)
-  }
-  
-  return(stripped)
-}
-
-
-
-###############################################################################
-# ANNOTATE PROSEG-SEURAT OBJECT
-#
-# Performance-critical rewrite of annotate_proseg_seurat.
-#
-# Key changes from v1:
-#   1. Cluster-mediated SingleR: pre-clusters at high resolution, classifies
-#      ~1000-3000 pseudobulk profiles instead of 220k individual cells.
-#      Reduces SingleR runtime from 24+ hours to ~5 minutes.
-#   2. Configurable reference label column via `ref_label_col` (v1 hardcoded
-#      `consensus_label`).
-#   3. Memory-efficient gene alignment — avoids rbind + reindex copies.
-#   4. RCTD defaults tuned for scale: higher core count, full mode default.
-#   5. Pre-clustering shared by SingleR and downstream subclustering.
-#
-# Expected runtime for 220k cells:
-#   Pre-clustering:    ~5–10 min
-#   SingleR (cluster): ~2–5 min
-#   RCTD (full, 32c):  ~1–3 hours
-#   Consensus+export:  ~1 min
-#   Total:             ~2–4 hours (was 24+ hours, often never finishing)
-###############################################################################
+######################################
+# RCTD AND SINGLER                   #
+######################################
 
 annotate_proseg_seurat <- function(proseg_dir,
                                    reference_dir,
@@ -2407,22 +4124,17 @@ annotate_proseg_seurat <- function(proseg_dir,
   invisible(summary_df)
 }
 
-################################################################################
-# LOGGING MESSAGE FUNCTION
-################################################################################
+#######################################################################
+#######################################################################
+#                                                                     #
+#                       SEGMENTATION DIAGNOSTICS                      #
+#                                                                     #
+#######################################################################
+#######################################################################
 
-log_msg <- function(...) {
-  cat(format(Sys.time(), "[%Y-%m-%d %H:%M:%S]"), paste0(...), "\n")
-}
+#CONTENTS: polygon plots, segmentation comparisons, nuclei per cell
 
-################################################################################
-# PLOTTING
-#
-# Centroid-level: use native ImageDimPlot (works via FOV centroids)
-# Polygon-level: use ggplot + geom_sf (works via @misc sf objects)
-################################################################################
-
-# Plot polygons from @misc with optional metadata fill
+#PLOT SEGMENTATION POLYGONS
 plot_polygons <- function(seu, polygon_slot, fill_by = NULL, line_col = "grey30",
                           line_width = 0.1) {
   require(ggplot2)
@@ -2455,8 +4167,7 @@ plot_polygons <- function(seu, polygon_slot, fill_by = NULL, line_col = "grey30"
   return(p)
 }
 
-
-# Plot feature expression on polygons
+#PLOT A FEATURE ON SEGMENTATION POLYGONS
 plot_spatial_feature <- function(seu, polygon_slot, feature,
                                  palette = viridis::viridis(100),
                                  line_col = "grey50", line_width = 0.05) {
@@ -2478,8 +4189,7 @@ plot_spatial_feature <- function(seu, polygon_slot, feature,
     theme_void() + coord_sf()
 }
 
-
-# Side-by-side segmentation comparison
+#SIDE BY SIDE SEGMENTATION COMPARISON
 compare_segmentations <- function(seu,
                                   slot1 = "proseg_polygons",
                                   slot2 = "xenium_polygons",
@@ -2493,8 +4203,7 @@ compare_segmentations <- function(seu,
   p1 + p2
 }
 
-
-# Zoomed comparison
+#ZOOMED SEGMENTATION COMPARISON
 compare_segmentations_zoomed <- function(seu,
                                          slot1 = "proseg_polygons",
                                          slot2 = "xenium_polygons",
@@ -2531,70 +4240,7 @@ compare_segmentations_zoomed <- function(seu,
   p1 + p2
 }
 
-
-################################################################################
-# NUCLEI-PER-CELL COMPUTATION
-################################################################################
-
-compute_nuclei_per_cell <- function(seu,
-                                    cell_slot,
-                                    nuclei_slot) {
-  require(sf)
-  
-  cells_sf  <- seu@misc[[cell_slot]]
-  nuclei_sf <- seu@misc[[nuclei_slot]]
-  
-  if (is.null(cells_sf))  stop("No polygons in @misc$", cell_slot)
-  if (is.null(nuclei_sf)) stop("No polygons in @misc$", nuclei_slot)
-  
-  cells_sf  <- st_make_valid(cells_sf)
-  nuclei_sf <- st_make_valid(nuclei_sf)
-  
-  message("Computing nuclei per cell...")
-  overlaps <- st_within(nuclei_sf, cells_sf, sparse = TRUE)
-  
-  cell_hits <- sapply(overlaps, function(hit) {
-    if (length(hit) == 0) return(NA_integer_)
-    hit[1]
-  })
-  
-  counts <- table(na.omit(cell_hits))
-  data.frame(
-    cell     = cells_sf$cell[as.integer(names(counts))],
-    n_nuclei = as.integer(counts)
-  )
-}
-
-
-compare_nuclei_segmentation <- function(seu,
-                                        cell_slot1, cell_slot2,
-                                        nuclei_slot,
-                                        labels = c("Segmentation 1", "Segmentation 2")) {
-  require(patchwork)
-  require(ggplot2)
-  
-  counts1 <- compute_nuclei_per_cell(seu, cell_slot1, nuclei_slot)
-  counts2 <- compute_nuclei_per_cell(seu, cell_slot2, nuclei_slot)
-  
-  plot_dist <- function(counts_df, title) {
-    ggplot(counts_df, aes(x = n_nuclei)) +
-      geom_histogram(binwidth = 1, fill = "steelblue", color = "white") +
-      theme_minimal() + ggtitle(title) +
-      labs(x = "Nuclei per cell", y = "Count")
-  }
-  
-  p1 <- plot_dist(counts1, labels[1])
-  p2 <- plot_dist(counts2, labels[2])
-  p1 + p2
-}
-
-
-################################################################################
-# TWO-PANEL SEGMENTATION WITH NUCLEI OVERLAY
-#
-# Replaces plot_two_segmentation_panels from the original code.
-################################################################################
-
+#TWO PANEL SEGMENTATION COMPARISON
 plot_two_segmentation_panels <- function(seu,
                                          cell_seg_slot1,
                                          cell_seg_slot2,
@@ -2637,11 +4283,135 @@ plot_two_segmentation_panels <- function(seu,
   p1 + p2
 }
 
+#COUNT NUCLEI PER SEGMENTED CELL
+compute_nuclei_per_cell <- function(seu,
+                                    cell_slot,
+                                    nuclei_slot) {
+  require(sf)
+  
+  cells_sf  <- seu@misc[[cell_slot]]
+  nuclei_sf <- seu@misc[[nuclei_slot]]
+  
+  if (is.null(cells_sf))  stop("No polygons in @misc$", cell_slot)
+  if (is.null(nuclei_sf)) stop("No polygons in @misc$", nuclei_slot)
+  
+  cells_sf  <- st_make_valid(cells_sf)
+  nuclei_sf <- st_make_valid(nuclei_sf)
+  
+  message("Computing nuclei per cell...")
+  overlaps <- st_within(nuclei_sf, cells_sf, sparse = TRUE)
+  
+  cell_hits <- sapply(overlaps, function(hit) {
+    if (length(hit) == 0) return(NA_integer_)
+    hit[1]
+  })
+  
+  counts <- table(na.omit(cell_hits))
+  data.frame(
+    cell     = cells_sf$cell[as.integer(names(counts))],
+    n_nuclei = as.integer(counts)
+  )
+}
 
-###############################################################################
-# Plot heatmap (pheatmap or ggplot fallback)
-###############################################################################
+#COMPARE NUCLEI ASSIGNMENT BETWEEN SEGMENTATIONS
+compare_nuclei_segmentation <- function(seu,
+                                        cell_slot1, cell_slot2,
+                                        nuclei_slot,
+                                        labels = c("Segmentation 1", "Segmentation 2")) {
+  require(patchwork)
+  require(ggplot2)
+  
+  counts1 <- compute_nuclei_per_cell(seu, cell_slot1, nuclei_slot)
+  counts2 <- compute_nuclei_per_cell(seu, cell_slot2, nuclei_slot)
+  
+  plot_dist <- function(counts_df, title) {
+    ggplot(counts_df, aes(x = n_nuclei)) +
+      geom_histogram(binwidth = 1, fill = "steelblue", color = "white") +
+      theme_minimal() + ggtitle(title) +
+      labs(x = "Nuclei per cell", y = "Count")
+  }
+  
+  p1 <- plot_dist(counts1, labels[1])
+  p2 <- plot_dist(counts2, labels[2])
+  p1 + p2
+}
 
+#######################################################################
+#######################################################################
+#                                                                     #
+#                          MARKER COMPARISON                          #
+#                                                                     #
+#######################################################################
+#######################################################################
+
+#CONTENTS: top markers per label, jaccard overlap, heatmaps
+
+#TOP MARKERS PER LABEL
+get_top_markers <- function(obj, label_col, n_top = 200) {
+  
+  Idents(obj) <- label_col
+  
+  if (requireNamespace("presto", quietly = TRUE)) {
+    cat("  Using presto for marker detection...\n")
+    
+    expr_mat <- GetAssayData(obj, layer = "data")
+    labels   <- obj@meta.data[[label_col]]
+    
+    res <- presto::wilcoxauc(expr_mat, labels)
+    res <- as.data.table(res)
+    
+    res <- res[logFC > 0 & padj < 0.05]
+    res <- res[order(group, -auc)]
+    markers <- res[, head(.SD, n_top), by = group]
+    
+    marker_list <- split(markers$feature, markers$group)
+    
+  } else {
+    cat("  presto not available. Using FindAllMarkers (this may be slow)...\n")
+    
+    all_markers <- FindAllMarkers(obj,
+                                  only.pos        = TRUE,
+                                  min.pct         = 0.1,
+                                  logfc.threshold = 0.25,
+                                  test.use        = "wilcox",
+                                  verbose         = FALSE)
+    all_markers <- as.data.table(all_markers)
+    all_markers <- all_markers[order(cluster, -avg_log2FC)]
+    top <- all_markers[, head(.SD, n_top), by = cluster]
+    
+    marker_list <- split(top$gene, top$cluster)
+  }
+  
+  return(marker_list)
+}
+
+#JACCARD OVERLAP BETWEEN TWO MARKER SETS
+compute_jaccard <- function(markers_row, markers_col) {
+  
+  row_names <- names(markers_row)
+  col_names <- names(markers_col)
+  
+  mat <- matrix(0,
+                nrow = length(row_names),
+                ncol = length(col_names),
+                dimnames = list(row_names, col_names))
+  
+  for (i in seq_along(row_names)) {
+    set_a <- markers_row[[i]]
+    for (j in seq_along(col_names)) {
+      set_b <- markers_col[[j]]
+      
+      n_intersect <- length(intersect(set_a, set_b))
+      n_union     <- length(union(set_a, set_b))
+      
+      mat[i, j] <- if (n_union == 0) 0 else n_intersect / n_union
+    }
+  }
+  
+  return(mat)
+}
+
+#JACCARD HEATMAP
 plot_jaccard_heatmap <- function(jaccard_mat, nm_row, nm_col,
                                  pair_tag, output_dir, n_top_markers,
                                  filtered = TRUE) {
@@ -2710,112 +4480,4 @@ plot_jaccard_heatmap <- function(jaccard_mat, nm_row, nm_col,
   }
   
   cat("  Saved:", basename(fname), "\n")
-}
-
-###############################################################################
-# get_top_markers
-#
-# Run DE (presto if available, else FindAllMarkers) and return a named list
-# of the top N marker genes per cell type.
-#
-# Args:
-#   obj        Seurat v5 object (must have normalised "data" layer)
-#   label_col  metadata column with cell-type labels
-#   n_top      max markers per type (default 200)
-#
-# Returns:
-#   Named list: names = cell types, values = character vectors of gene names
-###############################################################################
-
-get_top_markers <- function(obj, label_col, n_top = 200) {
-  
-  Idents(obj) <- label_col
-  
-  if (requireNamespace("presto", quietly = TRUE)) {
-    cat("  Using presto for marker detection...\n")
-    
-    expr_mat <- GetAssayData(obj, layer = "data")
-    labels   <- obj@meta.data[[label_col]]
-    
-    res <- presto::wilcoxauc(expr_mat, labels)
-    res <- as.data.table(res)
-    
-    res <- res[logFC > 0 & padj < 0.05]
-    res <- res[order(group, -auc)]
-    markers <- res[, head(.SD, n_top), by = group]
-    
-    marker_list <- split(markers$feature, markers$group)
-    
-  } else {
-    cat("  presto not available. Using FindAllMarkers (this may be slow)...\n")
-    
-    all_markers <- FindAllMarkers(obj,
-                                  only.pos        = TRUE,
-                                  min.pct         = 0.1,
-                                  logfc.threshold = 0.25,
-                                  test.use        = "wilcox",
-                                  verbose         = FALSE)
-    all_markers <- as.data.table(all_markers)
-    all_markers <- all_markers[order(cluster, -avg_log2FC)]
-    top <- all_markers[, head(.SD, n_top), by = cluster]
-    
-    marker_list <- split(top$gene, top$cluster)
-  }
-  
-  return(marker_list)
-}
-
-
-###############################################################################
-# compute_jaccard
-#
-# Pairwise Jaccard index between two sets of marker gene lists.
-#
-# J(A, B) = |A ∩ B| / |A ∪ B|
-#
-# Args:
-#   markers_row  Named list of character vectors (row labels in output matrix)
-#   markers_col  Named list of character vectors (column labels in output matrix)
-#
-# Returns:
-#   Numeric matrix [length(markers_row) x length(markers_col)]
-#   Row names = names(markers_row), col names = names(markers_col)
-###############################################################################
-
-compute_jaccard <- function(markers_row, markers_col) {
-  
-  row_names <- names(markers_row)
-  col_names <- names(markers_col)
-  
-  mat <- matrix(0,
-                nrow = length(row_names),
-                ncol = length(col_names),
-                dimnames = list(row_names, col_names))
-  
-  for (i in seq_along(row_names)) {
-    set_a <- markers_row[[i]]
-    for (j in seq_along(col_names)) {
-      set_b <- markers_col[[j]]
-      
-      n_intersect <- length(intersect(set_a, set_b))
-      n_union     <- length(union(set_a, set_b))
-      
-      mat[i, j] <- if (n_union == 0) 0 else n_intersect / n_union
-    }
-  }
-  
-  return(mat)
-}
-
-
-################################################################################
-# HELPER: resolve coordinate column names
-################################################################################
-
-resolve_coord_col <- function(meta_colnames, preferred, alternatives) {
-  if (preferred %in% meta_colnames) return(preferred)
-  for (alt in alternatives) {
-    if (alt %in% meta_colnames) return(alt)
-  }
-  return(preferred)  # fall through, will be caught later
 }

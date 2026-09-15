@@ -15,7 +15,6 @@ embedded at the bottom of this file for that purpose.
 
 SCOPE NOTE (read this):
   The published reference integrates E13.5, E16.5, E18.5, PD0, PD2, PD4.
-  The three public datasets you have cover E13.5, E16.5, PD0, PD2, PD4 only.
   E18.5 scRNA lives in the new GEO (GSE286328: GSM8723662/3) and is NOT
   included here. Omitting it means:
     - total cell count will not match the paper's 67,558,

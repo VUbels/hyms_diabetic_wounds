@@ -54,7 +54,7 @@ warnings.filterwarnings("ignore")
 
 # Data keys (matching your h5ad structure)
 SPATIAL_KEY = "X_spatial"          # obsm key for proseg centroid coordinates
-CELL_TYPE_KEY = "predicted_cell_type"  # obs column for cell annotations
+CELL_TYPE_KEY = "cell_type"  # obs column for cell annotations
 COUNTS_KEY = "counts"              # layer key NicheCompass expects for raw counts
 
 # Condition mapping — token -> condition label.
